@@ -15,6 +15,7 @@
 #include <fstream>
 #include <cctype>
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include "json.hpp"
 
@@ -66,6 +67,14 @@ bool g_selftest = false;
 // only a couple of periods the playback side starves periodically even when
 // there is plenty of CPU headroom. 0 = leave RtAudio's default.
 unsigned int g_periods = 0;
+
+// --record FILE.wav : capture exactly what the callback receives and exactly
+// what it writes, into a stereo float32 WAV (L = input, R = output). The
+// callback only memcpys into a preallocated buffer; the file is written at exit.
+std::string g_record_path;
+std::vector<float>        g_rec;          // interleaved L=in, R=out
+std::atomic<size_t>       g_rec_pos{0};   // in frames
+size_t                    g_rec_capacity = 0;
 
 // How long model->process() takes, against the deadline the block gives us.
 // This is the number that actually decides whether the Pi can run a model:
@@ -182,6 +191,19 @@ int audioCallback(void* outputBuffer, void* inputBuffer,
         out[i * CHANNELS + 1] = y;
     }
 
+    // Capture in/out for offline analysis. Preallocated; no I/O, no locks.
+    if (g_rec_capacity > 0) {
+        const size_t pos = g_rec_pos.load(std::memory_order_relaxed);
+        if (pos + nFrames <= g_rec_capacity) {
+            float* dst = g_rec.data() + pos * 2;
+            for (unsigned int i = 0; i < nFrames; ++i) {
+                dst[i * 2]     = mi[i];
+                dst[i * 2 + 1] = mo[i];
+            }
+            g_rec_pos.store(pos + nFrames, std::memory_order_relaxed);
+        }
+    }
+
     atomicMax(g_peak_in, peakIn);
     atomicMax(g_peak_out, peakOut);
     if (clipIn)  g_clip_in.fetch_add(clipIn, std::memory_order_relaxed);
@@ -211,6 +233,26 @@ static std::string dbfs(float peak) {
     return std::string(buf);
 }
 
+
+
+// Minimal 32-bit-float stereo WAV writer.
+static bool writeWavF32(const std::string& path, const float* data,
+                        size_t frames, unsigned int channels, unsigned int rate) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    const uint32_t dataBytes = static_cast<uint32_t>(frames * channels * sizeof(float));
+    const uint32_t byteRate  = rate * channels * sizeof(float);
+    const uint16_t blockAlign = static_cast<uint16_t>(channels * sizeof(float));
+    auto u32 = [&f](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
+    auto u16 = [&f](uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+    f.write("RIFF", 4);  u32(36 + dataBytes);  f.write("WAVE", 4);
+    f.write("fmt ", 4);  u32(16);  u16(3);              // 3 = IEEE float
+    u16(static_cast<uint16_t>(channels));  u32(rate);  u32(byteRate);
+    u16(blockAlign);  u16(32);
+    f.write("data", 4);  u32(dataBytes);
+    f.write(reinterpret_cast<const char*>(data), dataBytes);
+    return f.good();
+}
 
 // ---------------------------------------------------------------------------
 // Offline block-size consistency check.
@@ -326,6 +368,8 @@ int main(int argc, char** argv) {
             g_selftest = true;
         } else if ((arg == "--periods" || arg == "-p") && i + 1 < argc) {
             g_periods = static_cast<unsigned int>(std::atoi(argv[++i]));
+        } else if (arg == "--record" && i + 1 < argc) {
+            g_record_path = argv[++i];
         } else {
             modelPath = arg;
         }
@@ -476,6 +520,12 @@ int main(int argc, char** argv) {
                      "(brighter/darker and wrong in time).\n";
     }
 
+    if (!g_record_path.empty()) {
+        g_rec_capacity = 60 * SAMPLE_RATE;              // 60 seconds is plenty
+        g_rec.assign(g_rec_capacity * 2, 0.0f);
+        std::cout << "Recording to " << g_record_path << " (up to 60 s, L=input R=output)\n";
+    }
+
     CallbackData callbackData;
     callbackData.model = model.get();
     callbackData.mono_in.assign(MAX_FRAMES, 0.0f);
@@ -621,5 +671,16 @@ int main(int argc, char** argv) {
 
     audio.stopStream();
     audio.closeStream();
+
+    if (!g_record_path.empty()) {
+        const size_t frames = g_rec_pos.load();
+        if (writeWavF32(g_record_path, g_rec.data(), frames, 2, SAMPLE_RATE)) {
+            std::cout << "\nWrote " << frames << " frames ("
+                      << (static_cast<double>(frames) / SAMPLE_RATE)
+                      << " s) to " << g_record_path << "\n";
+        } else {
+            std::cerr << "\nFailed to write " << g_record_path << "\n";
+        }
+    }
     return 0;
 }
