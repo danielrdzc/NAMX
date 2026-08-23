@@ -78,6 +78,9 @@ bool  g_gate_on   = false;   float g_gate_db    = -45.0f;
 bool  g_od_on     = false;   float g_od_drive   = 0.5f;
 float g_od_tone   = 0.5f;    float g_od_level   = 0.5f;
 bool  g_normalize = false;   float g_target_db  = -18.0f;
+bool  g_ph_on     = false;   float g_ph_rate    = 0.5f;
+float g_ph_depth  = 0.7f;    float g_ph_fb      = 0.3f;
+float g_ph_mix    = 0.5f;    int   g_ph_stages  = 4;
 
 std::string g_record_path;
 std::vector<float>        g_rec;          // interleaved L=in, R=out
@@ -389,6 +392,16 @@ int main(int argc, char** argv) {
             g_od_level = static_cast<float>(std::atof(argv[++i]));
         } else if (arg == "--normalize") {
             g_normalize = true;
+        } else if (arg == "--phaser" && i + 1 < argc) {
+            g_ph_on = true;    g_ph_rate = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--phaser-depth" && i + 1 < argc) {
+            g_ph_depth = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--phaser-fb" && i + 1 < argc) {
+            g_ph_fb = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--phaser-mix" && i + 1 < argc) {
+            g_ph_mix = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--phaser-stages" && i + 1 < argc) {
+            g_ph_stages = std::atoi(argv[++i]);
         } else {
             modelPath = arg;
         }
@@ -571,6 +584,16 @@ int main(int argc, char** argv) {
         od->setTone(g_od_tone);
         od->setLevel(g_od_level);
         chain.add(std::move(od));
+    }
+
+    if (g_ph_on) {
+        auto ph = std::make_unique<fx::Phaser>();
+        ph->setRateHz(g_ph_rate);
+        ph->setDepth(g_ph_depth);
+        ph->setFeedback(g_ph_fb);
+        ph->setMix(g_ph_mix);
+        ph->setStages(g_ph_stages);
+        chain.add(std::move(ph));
     }
 
     auto namFx = std::make_unique<fx::NamModel>(std::move(model));

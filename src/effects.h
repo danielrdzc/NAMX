@@ -225,6 +225,98 @@ private:
     float _hpCoef = 0, _hpX = 0, _hpY = 0, _lp = 0;
 };
 
+
+// ---------------------------------------------------------------------------
+// Phaser.
+//
+// Como funciona: una cadena de filtros pasa-todo de primer orden. Un pasa-todo
+// no cambia la amplitud de nada -- solo corre la fase, y cuanto mas alta la
+// frecuencia, mas la corre. Al sumar esa señal desfasada con la original, en las
+// frecuencias donde quedaron en oposicion se cancelan: aparecen muescas. Un LFO
+// barre la frecuencia de los pasa-todo, las muescas se mueven, y eso es el
+// sonido. Cada PAR de etapas produce una muesca: 4 etapas = 2 muescas (el
+// MXR Phase 90), 8 etapas = 4 (mas denso, mas Univibe).
+//
+// La realimentacion reinyecta la salida a la entrada y afila las muescas,
+// haciendo el efecto mas resonante y vocal.
+// ---------------------------------------------------------------------------
+class Phaser : public Effect {
+public:
+    static constexpr int kMaxStages = 8;
+
+    const char* name() const override { return "phaser"; }
+
+    void setRateHz(float hz)   { _rate.store(clampf(hz, 0.02f, 12.0f), std::memory_order_relaxed); }
+    void setDepth(float v)     { _depth.set(clampf(v, 0.0f, 1.0f)); }
+    void setFeedback(float v)  { _fb.set(clampf(v, 0.0f, 0.85f)); }   // >0.9 se vuelve inestable
+    void setMix(float v)       { _mix.set(clampf(v, 0.0f, 1.0f)); }
+    void setStages(int s)      { _stages = (s < 2) ? 2 : (s > kMaxStages ? kMaxStages : (s & ~1)); }
+
+    void prepare(double sampleRate, int) override {
+        _sr = sampleRate;
+        _depth.prepare(sampleRate, 30.0);
+        _fb.prepare(sampleRate, 30.0);
+        _mix.prepare(sampleRate, 30.0);
+        reset();
+    }
+
+    void reset() override {
+        for (int i = 0; i < kMaxStages; ++i) { _x1[i] = 0.0f; _y1[i] = 0.0f; }
+        _phase = 0.0f; _last = 0.0f; _a = 0.0f; _counter = 0;
+    }
+
+    void process(float* buf, int n) override {
+        const float rate = _rate.load(std::memory_order_relaxed);
+        const float phaseInc = rate / static_cast<float>(_sr);
+
+        for (int i = 0; i < n; ++i) {
+            // El coeficiente del pasa-todo solo se recalcula cada 32 muestras.
+            // El LFO va a pocos Hz, asi que 1.5 kHz de actualizacion sobra, y nos
+            // ahorra un tan() por muestra.
+            if (_counter <= 0) {
+                _counter = 32;
+                const float lfo = std::sin(2.0f * kPi * _phase);          // -1..1
+                const float d   = _depth.next();
+                // barrido logaritmico, que es como se percibe la frecuencia
+                const float fmin = 200.0f;
+                const float fmax = 200.0f + 1800.0f * d;
+                const float t    = 0.5f * (lfo + 1.0f);
+                const float fc   = fmin * std::pow(fmax / fmin, t);
+                const float tanv = std::tan(kPi * fc / static_cast<float>(_sr));
+                _a = (tanv - 1.0f) / (tanv + 1.0f);
+            }
+            --_counter;
+            _phase += phaseInc;
+            if (_phase >= 1.0f) _phase -= 1.0f;
+
+            const float dry = buf[i];
+            float x = dry + _fb.next() * _last;
+
+            // cadena de pasa-todo: H(z) = (a + z^-1) / (1 + a z^-1)
+            for (int s = 0; s < _stages; ++s) {
+                const float y = _a * x + _x1[s] - _a * _y1[s];
+                _x1[s] = x;
+                _y1[s] = y;
+                x = y;
+            }
+            _last = x;
+
+            const float mix = _mix.next();
+            buf[i] = dry * (1.0f - mix) + x * mix;
+        }
+    }
+
+private:
+    static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+    std::atomic<float> _rate{0.5f};
+    Smoothed _depth, _fb, _mix;
+    double _sr = 48000.0;
+    int   _stages = 4;
+    float _x1[kMaxStages]{}, _y1[kMaxStages]{};
+    float _phase = 0.0f, _last = 0.0f, _a = 0.0f;
+    int   _counter = 0;
+};
+
 // ---------------------------------------------------------------------------
 // Ganancia simple. Sirve para normalizar la salida del modelo con GetLoudness()
 // para que cambiar de capture no te cambie el volumen.
