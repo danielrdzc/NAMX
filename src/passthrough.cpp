@@ -1,6 +1,8 @@
 #include "RtAudio.h"
 #include "NAM/get_dsp.h"
 #include "NAM/slimmable.h"
+#include "effects.h"
+#include "nam_effect.h"
 #include <iostream>
 #include <vector>
 #include <cstring>
@@ -71,6 +73,12 @@ unsigned int g_periods = 0;
 // --record FILE.wav : capture exactly what the callback receives and exactly
 // what it writes, into a stereo float32 WAV (L = input, R = output). The
 // callback only memcpys into a preallocated buffer; the file is written at exit.
+// Efectos. Apagados por omision: se encienden pasando su flag.
+bool  g_gate_on   = false;   float g_gate_db    = -45.0f;
+bool  g_od_on     = false;   float g_od_drive   = 0.5f;
+float g_od_tone   = 0.5f;    float g_od_level   = 0.5f;
+bool  g_normalize = false;   float g_target_db  = -18.0f;
+
 std::string g_record_path;
 std::vector<float>        g_rec;          // interleaved L=in, R=out
 std::atomic<size_t>       g_rec_pos{0};   // in frames
@@ -107,7 +115,7 @@ inline void atomicMax(std::atomic<float>& target, float value) {
 }
 
 struct CallbackData {
-    nam::DSP* model;
+    fx::Chain* chain;
     // Scratch buffers, allocated before the stream starts. Never allocate here.
     std::vector<float> mono_in;
     std::vector<float> mono_out;
@@ -153,13 +161,14 @@ int audioCallback(void* outputBuffer, void* inputBuffer,
         if (a >= 0.999f) ++clipIn;               // already clipped by the interface
     }
 
+    // Denormales a cero. Es por hilo, y este es el hilo de audio.
+    static thread_local bool ftzDone = false;
+    if (!ftzDone) { fx::enableFlushToZero(); ftzDone = true; }
+
     const auto t0 = std::chrono::steady_clock::now();
-    if (g_bypass) {
-        std::memcpy(mo, mi, nFrames * sizeof(float));
-    } else {
-        float* in_channels[]  = { mi };
-        float* out_channels[] = { mo };
-        data->model->process(in_channels, out_channels, static_cast<int>(nFrames));
+    std::memcpy(mo, mi, nFrames * sizeof(float));
+    if (!g_bypass) {
+        data->chain->process(mo, static_cast<int>(nFrames));
     }
     const long long elapsed_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -370,6 +379,16 @@ int main(int argc, char** argv) {
             g_periods = static_cast<unsigned int>(std::atoi(argv[++i]));
         } else if (arg == "--record" && i + 1 < argc) {
             g_record_path = argv[++i];
+        } else if (arg == "--gate" && i + 1 < argc) {
+            g_gate_on = true;  g_gate_db = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--od" && i + 1 < argc) {
+            g_od_on = true;    g_od_drive = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--od-tone" && i + 1 < argc) {
+            g_od_tone = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--od-level" && i + 1 < argc) {
+            g_od_level = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--normalize") {
+            g_normalize = true;
         } else {
             modelPath = arg;
         }
@@ -536,8 +555,39 @@ int main(int argc, char** argv) {
         std::cout << "Recording to " << g_record_path << " (up to 60 s, L=input R=output)\n";
     }
 
+    // ---- cadena de efectos -------------------------------------------------
+    // Orden de rig real: gate -> overdrive -> AMPLI -> nivel.
+    // El overdrive va ANTES del modelo, igual que un pedal delante de un ampli.
+    fx::Chain chain;
+
+    if (g_gate_on) {
+        auto g = std::make_unique<fx::NoiseGate>();
+        g->setThresholdDb(g_gate_db);
+        chain.add(std::move(g));
+    }
+    if (g_od_on) {
+        auto od = std::make_unique<fx::Overdrive>();
+        od->setDrive(g_od_drive);
+        od->setTone(g_od_tone);
+        od->setLevel(g_od_level);
+        chain.add(std::move(od));
+    }
+
+    auto namFx = std::make_unique<fx::NamModel>(std::move(model));
+    nam::DSP* namDsp = namFx->dsp();
+    chain.add(std::move(namFx));
+
+    if (g_normalize) {
+        auto gain = std::make_unique<fx::Gain>();
+        const float loud = namDsp->HasLoudness()
+                         ? static_cast<float>(namDsp->GetLoudness()) : g_target_db;
+        gain->setGainDb(g_target_db - loud);
+        chain.add(std::move(gain));
+        std::cout << "Output normalization: " << (g_target_db - loud) << " dB\n";
+    }
+
     CallbackData callbackData;
-    callbackData.model = model.get();
+    callbackData.chain = &chain;
     callbackData.mono_in.assign(MAX_FRAMES, 0.0f);
     callbackData.mono_out.assign(MAX_FRAMES, 0.0f);
 
@@ -564,11 +614,14 @@ int main(int argc, char** argv) {
         // from what we asked for) and before startStream.
         g_reset_frames = bufferFrames;
         g_deadline_ns = 1e9 * static_cast<double>(bufferFrames) / SAMPLE_RATE;
-        model->Reset(static_cast<double>(SAMPLE_RATE), static_cast<int>(bufferFrames));
+
+        // prepare() reserva toda la memoria de la cadena y hace el Reset del
+        // modelo. Despues de esto, nada en el hilo de audio reserva nada.
+        chain.prepare(static_cast<double>(SAMPLE_RATE), static_cast<int>(bufferFrames));
 
         // Slimmable models carry several submodels at different cost/quality.
         // Reset() first so the submodel gets the right sample rate and block size.
-        if (auto* slim = dynamic_cast<nam::SlimmableModel*>(model.get())) {
+        if (auto* slim = dynamic_cast<nam::SlimmableModel*>(namDsp)) {
             const auto breakpoints = slim->GetSlimmableSizeBreakpoints();
             std::cout << "Slimmable model. Breakpoints:";
             if (breakpoints.empty()) std::cout << " (none)";
@@ -581,6 +634,7 @@ int main(int argc, char** argv) {
         } else if (g_slim >= 0.0) {
             std::cout << "This model is not slimmable; --slim ignored.\n";
         }
+        chain.reset();
 
         audio.startStream();
     } catch (std::exception& e) {
@@ -605,6 +659,11 @@ int main(int argc, char** argv) {
               << (options.numberOfBuffers ? std::to_string(options.numberOfBuffers)
                                           : std::string("driver default"))
               << "   (cushion = periods x buffer frames)\n";
+    std::cout << "Chain:        ";
+    if (g_bypass) std::cout << "(bypass)";
+    else for (size_t i = 0; i < chain.size(); ++i)
+        std::cout << (i ? " -> " : "") << chain.at(i)->name();
+    std::cout << "\n";
     std::cout << "Channels:     " << CHANNELS << " in / " << CHANNELS
               << " out (device native; guitar read from channel 1)\n";
     std::cout << "Output clamp: " << (CLAMP_OUTPUT ? "ON" : "OFF") << "\n";
@@ -648,7 +707,7 @@ int main(int argc, char** argv) {
         const double budgetUs = g_deadline_ns / 1000.0;
         std::cout << std::fixed << std::setprecision(1);
         std::cout << "Block deadline:   " << budgetUs << " us\n";
-        std::cout << "Process time:     avg " << avgUs << " us ("
+        std::cout << "Chain time:       avg " << avgUs << " us ("
                   << (100.0 * avgUs / budgetUs) << "% of deadline), max "
                   << maxUs << " us (" << (100.0 * maxUs / budgetUs) << "%)\n";
         std::cout << "Blocks over deadline: " << g_deadline_misses.load()
