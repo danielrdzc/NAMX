@@ -13,6 +13,7 @@
 #include <cstring>
 #include <memory>
 #include <vector>
+#include <algorithm>
 
 #if defined(__aarch64__)
   #include <cstdint>
@@ -315,6 +316,177 @@ private:
     float _x1[kMaxStages]{}, _y1[kMaxStages]{};
     float _phase = 0.0f, _last = 0.0f, _a = 0.0f;
     int   _counter = 0;
+};
+
+
+// ---------------------------------------------------------------------------
+// Delay.
+//
+// Buffer circular con lectura FRACCIONARIA e interpolacion lineal. Eso permite
+// dos cosas: tiempos de retardo que no caen en muestras exactas, y que al mover
+// el tiempo la lectura se deslice en vez de saltar -- suena como una cinta
+// acelerando o frenando, que es justo lo que hace un delay analogico.
+//
+// El filtro pasa-bajos va DENTRO del lazo de realimentacion, asi que cada
+// repeticion sale mas oscura que la anterior. Sin eso las repeticiones suenan
+// digitales y frias; con eso se van apagando como en una cinta.
+// ---------------------------------------------------------------------------
+class Delay : public Effect {
+public:
+    const char* name() const override { return "delay"; }
+
+    void setTimeMs(float ms)   { _timeMs = clampf(ms, 1.0f, 1990.0f); }
+    void setFeedback(float v)  { _fb.set(clampf(v, 0.0f, 0.95f)); }   // 1.0 se realimenta sin fin
+    void setMix(float v)       { _mix.set(clampf(v, 0.0f, 1.0f)); }
+    void setTone(float v)      { _tone = clampf(v, 0.0f, 1.0f); }     // 0 = repeticiones oscuras
+
+    void prepare(double sampleRate, int) override {
+        _sr   = sampleRate;
+        _size = static_cast<int>(sampleRate * 2.0) + 4;               // 2 segundos
+        _buf.assign(static_cast<size_t>(_size), 0.0f);
+        _fb.prepare(sampleRate, 40.0);
+        _mix.prepare(sampleRate, 40.0);
+        // el tiempo se suaviza LENTO a proposito: es lo que produce el glissando
+        _time.prepare(sampleRate, 250.0);
+        _time.snap(static_cast<float>(_timeMs * 0.001 * sampleRate));
+        const float fc = 800.0f + _tone * 7200.0f;
+        _lpCoef = 1.0f - std::exp(-2.0f * kPi * fc / static_cast<float>(sampleRate));
+        reset();
+    }
+
+    void reset() override {
+        std::fill(_buf.begin(), _buf.end(), 0.0f);
+        _write = 0; _lp = 0.0f;
+    }
+
+    void process(float* buf, int n) override {
+        _time.set(static_cast<float>(_timeMs * 0.001 * _sr));
+        for (int i = 0; i < n; ++i) {
+            const float dry   = buf[i];
+            const float delay = _time.next();
+
+            float readPos = static_cast<float>(_write) - delay;
+            while (readPos < 0.0f) readPos += static_cast<float>(_size);
+
+            const int   i0   = static_cast<int>(readPos);
+            const float frac = readPos - static_cast<float>(i0);
+            const int   i1   = (i0 + 1) % _size;
+            const float wet  = _buf[i0] + frac * (_buf[i1] - _buf[i0]);
+
+            // pasa-bajos dentro del lazo: cada repeticion mas oscura
+            _lp += _lpCoef * (wet - _lp);
+
+            _buf[_write] = dry + _lp * _fb.next();
+            if (++_write >= _size) _write = 0;
+
+            const float mix = _mix.next();
+            buf[i] = dry + wet * mix;
+        }
+    }
+
+private:
+    static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+    std::vector<float> _buf;
+    Smoothed _fb, _mix, _time;
+    double _sr = 48000.0;
+    float _timeMs = 400.0f, _tone = 0.5f, _lpCoef = 0.0f, _lp = 0.0f;
+    int _size = 0, _write = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Reverb (topologia Freeverb, de Jezar).
+//
+// La idea: ocho filtros peine en PARALELO generan la cola de ecos densos --
+// cada uno con un retardo distinto y primo entre si, para que sus repeticiones
+// no coincidan y no se oiga un patron. Despues, cuatro pasa-todo EN SERIE
+// difuminan el resultado: no cambian el espectro, solo desparraman los ecos en
+// el tiempo hasta que dejan de oirse como ecos y empiezan a oirse como espacio.
+//
+// El amortiguamiento (damp) es un pasa-bajos dentro de cada peine: los agudos
+// se apagan antes que los graves, igual que en un cuarto real donde las
+// superficies absorben mas las frecuencias altas.
+// ---------------------------------------------------------------------------
+class Reverb : public Effect {
+public:
+    const char* name() const override { return "reverb"; }
+
+    void setRoomSize(float v) { _room.set(clampf(v, 0.0f, 1.0f) * 0.28f + 0.7f); }
+    void setDamp(float v)     { _damp.set(clampf(v, 0.0f, 1.0f) * 0.4f); }
+    void setMix(float v)      { _mix.set(clampf(v, 0.0f, 1.0f)); }
+
+    void prepare(double sampleRate, int) override {
+        // Las longitudes originales de Freeverb son para 44.1 kHz; se escalan.
+        const double k = sampleRate / 44100.0;
+        static const int combTune[kCombs] = {1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617};
+        static const int apTune[kAllpass] = {556, 441, 341, 225};
+
+        for (int i = 0; i < kCombs; ++i) {
+            _combLen[i] = static_cast<int>(combTune[i] * k);
+            _comb[i].assign(static_cast<size_t>(_combLen[i]), 0.0f);
+        }
+        for (int i = 0; i < kAllpass; ++i) {
+            _apLen[i] = static_cast<int>(apTune[i] * k);
+            _ap[i].assign(static_cast<size_t>(_apLen[i]), 0.0f);
+        }
+        _room.prepare(sampleRate, 50.0);
+        _damp.prepare(sampleRate, 50.0);
+        _mix.prepare(sampleRate, 50.0);
+        reset();
+    }
+
+    void reset() override {
+        for (int i = 0; i < kCombs; ++i) {
+            std::fill(_comb[i].begin(), _comb[i].end(), 0.0f);
+            _combIdx[i] = 0; _store[i] = 0.0f;
+        }
+        for (int i = 0; i < kAllpass; ++i) {
+            std::fill(_ap[i].begin(), _ap[i].end(), 0.0f);
+            _apIdx[i] = 0;
+        }
+    }
+
+    void process(float* buf, int n) override {
+        for (int i = 0; i < n; ++i) {
+            const float dry  = buf[i];
+            const float in   = dry * kFixedGain;
+            const float room = _room.next();
+            const float damp = _damp.next();
+
+            // peines en paralelo
+            float acc = 0.0f;
+            for (int c = 0; c < kCombs; ++c) {
+                const float out = _comb[c][_combIdx[c]];
+                _store[c] = out * (1.0f - damp) + _store[c] * damp;   // amortiguamiento
+                _comb[c][_combIdx[c]] = in + _store[c] * room;
+                if (++_combIdx[c] >= _combLen[c]) _combIdx[c] = 0;
+                acc += out;
+            }
+
+            // pasa-todo en serie: difusion
+            float y = acc;
+            for (int a = 0; a < kAllpass; ++a) {
+                const float bufout = _ap[a][_apIdx[a]];
+                const float out    = bufout - y;
+                _ap[a][_apIdx[a]]  = y + bufout * 0.5f;
+                if (++_apIdx[a] >= _apLen[a]) _apIdx[a] = 0;
+                y = out;
+            }
+
+            const float mix = _mix.next();
+            buf[i] = dry * (1.0f - mix * 0.5f) + y * mix;
+        }
+    }
+
+private:
+    static constexpr int   kCombs      = 8;
+    static constexpr int   kAllpass    = 4;
+    static constexpr float kFixedGain  = 0.015f;
+    static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+    std::vector<float> _comb[kCombs], _ap[kAllpass];
+    int   _combLen[kCombs]{}, _combIdx[kCombs]{}, _apLen[kAllpass]{}, _apIdx[kAllpass]{};
+    float _store[kCombs]{};
+    Smoothed _room, _damp, _mix;
 };
 
 // ---------------------------------------------------------------------------

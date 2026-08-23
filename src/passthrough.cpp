@@ -73,6 +73,11 @@ unsigned int g_periods = 0;
 // --record FILE.wav : capture exactly what the callback receives and exactly
 // what it writes, into a stereo float32 WAV (L = input, R = output). The
 // callback only memcpys into a preallocated buffer; the file is written at exit.
+std::string g_record_path;
+std::vector<float>        g_rec;          // interleaved L=in, R=out
+std::atomic<size_t>       g_rec_pos{0};   // in frames
+size_t                    g_rec_capacity = 0;
+
 // Efectos. Apagados por omision: se encienden pasando su flag.
 bool  g_gate_on   = false;   float g_gate_db    = -45.0f;
 bool  g_od_on     = false;   float g_od_drive   = 0.5f;
@@ -81,11 +86,11 @@ bool  g_normalize = false;   float g_target_db  = -18.0f;
 bool  g_ph_on     = false;   float g_ph_rate    = 0.5f;
 float g_ph_depth  = 0.7f;    float g_ph_fb      = 0.3f;
 float g_ph_mix    = 0.5f;    int   g_ph_stages  = 4;
+bool  g_dly_on    = false;   float g_dly_ms     = 400.0f;
+float g_dly_fb    = 0.35f;   float g_dly_mix    = 0.3f;   float g_dly_tone = 0.5f;
+bool  g_rev_on    = false;   float g_rev_mix    = 0.25f;
+float g_rev_room  = 0.6f;    float g_rev_damp   = 0.5f;
 
-std::string g_record_path;
-std::vector<float>        g_rec;          // interleaved L=in, R=out
-std::atomic<size_t>       g_rec_pos{0};   // in frames
-size_t                    g_rec_capacity = 0;
 
 // How long model->process() takes, against the deadline the block gives us.
 // This is the number that actually decides whether the Pi can run a model:
@@ -402,6 +407,20 @@ int main(int argc, char** argv) {
             g_ph_mix = static_cast<float>(std::atof(argv[++i]));
         } else if (arg == "--phaser-stages" && i + 1 < argc) {
             g_ph_stages = std::atoi(argv[++i]);
+        } else if (arg == "--delay" && i + 1 < argc) {
+            g_dly_on = true;   g_dly_ms = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--delay-fb" && i + 1 < argc) {
+            g_dly_fb = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--delay-mix" && i + 1 < argc) {
+            g_dly_mix = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--delay-tone" && i + 1 < argc) {
+            g_dly_tone = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--reverb" && i + 1 < argc) {
+            g_rev_on = true;   g_rev_mix = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--reverb-room" && i + 1 < argc) {
+            g_rev_room = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--reverb-damp" && i + 1 < argc) {
+            g_rev_damp = static_cast<float>(std::atof(argv[++i]));
         } else {
             modelPath = arg;
         }
@@ -607,6 +626,24 @@ int main(int argc, char** argv) {
         gain->setGainDb(g_target_db - loud);
         chain.add(std::move(gain));
         std::cout << "Output normalization: " << (g_target_db - loud) << " dB\n";
+    }
+
+    // Delay y reverb van DESPUES del ampli, como en un loop de efectos.
+    // Antes del ampli el delay se distorsiona y se vuelve papilla.
+    if (g_dly_on) {
+        auto d = std::make_unique<fx::Delay>();
+        d->setTimeMs(g_dly_ms);
+        d->setFeedback(g_dly_fb);
+        d->setMix(g_dly_mix);
+        d->setTone(g_dly_tone);
+        chain.add(std::move(d));
+    }
+    if (g_rev_on) {
+        auto r = std::make_unique<fx::Reverb>();
+        r->setMix(g_rev_mix);
+        r->setRoomSize(g_rev_room);
+        r->setDamp(g_rev_damp);
+        chain.add(std::move(r));
     }
 
     CallbackData callbackData;
