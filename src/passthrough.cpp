@@ -61,6 +61,12 @@ double g_slim = -1.0;
 // the bug, and this proves it without any driver in the picture.
 bool g_selftest = false;
 
+// --periods N : how many periods of cushion the device buffer gets.
+// The callback's own duration delays the write relative to the read, so with
+// only a couple of periods the playback side starves periodically even when
+// there is plenty of CPU headroom. 0 = leave RtAudio's default.
+unsigned int g_periods = 0;
+
 // How long model->process() takes, against the deadline the block gives us.
 // This is the number that actually decides whether the Pi can run a model:
 // RtAudio's xrun flag on ALSA stays 0 even while the card is starving.
@@ -318,6 +324,8 @@ int main(int argc, char** argv) {
             g_slim = std::atof(argv[++i]);
         } else if (arg == "--selftest") {
             g_selftest = true;
+        } else if ((arg == "--periods" || arg == "-p") && i + 1 < argc) {
+            g_periods = static_cast<unsigned int>(std::atoi(argv[++i]));
         } else {
             modelPath = arg;
         }
@@ -484,6 +492,7 @@ int main(int argc, char** argv) {
     RtAudio::StreamOptions options;
     options.flags = RTAUDIO_SCHEDULE_REALTIME;
     options.priority = 90;
+    if (g_periods > 0) options.numberOfBuffers = g_periods;
 
     try {
         audio.openStream(&outParams, &inParams, RTAUDIO_FLOAT32,
@@ -532,6 +541,10 @@ int main(int argc, char** argv) {
               << latencyMs << " ms\n";
     std::cout << "(actual latency also includes driver + hardware,"
                  " typically +1-3ms)\n";
+    std::cout << "Periods:      "
+              << (options.numberOfBuffers ? std::to_string(options.numberOfBuffers)
+                                          : std::string("driver default"))
+              << "   (cushion = periods x buffer frames)\n";
     std::cout << "Channels:     " << CHANNELS << " in / " << CHANNELS
               << " out (device native; guitar read from channel 1)\n";
     std::cout << "Output clamp: " << (CLAMP_OUTPUT ? "ON" : "OFF") << "\n";
