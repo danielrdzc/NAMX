@@ -3,6 +3,7 @@
 #include "NAM/slimmable.h"
 #include "effects.h"
 #include "nam_effect.h"
+#include "webui.h"
 #include <iostream>
 #include <vector>
 #include <cstring>
@@ -90,6 +91,7 @@ bool  g_dly_on    = false;   float g_dly_ms     = 400.0f;
 float g_dly_fb    = 0.35f;   float g_dly_mix    = 0.3f;   float g_dly_tone = 0.5f;
 bool  g_rev_on    = false;   float g_rev_mix    = 0.25f;
 float g_rev_room  = 0.6f;    float g_rev_damp   = 0.5f;
+bool  g_web_on    = true;    int   g_web_port   = 8080;
 
 
 // How long model->process() takes, against the deadline the block gives us.
@@ -421,6 +423,10 @@ int main(int argc, char** argv) {
             g_rev_room = static_cast<float>(std::atof(argv[++i]));
         } else if (arg == "--reverb-damp" && i + 1 < argc) {
             g_rev_damp = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--port" && i + 1 < argc) {
+            g_web_port = std::atoi(argv[++i]);
+        } else if (arg == "--no-web") {
+            g_web_on = false;
         } else {
             modelPath = arg;
         }
@@ -590,61 +596,63 @@ int main(int argc, char** argv) {
     // ---- cadena de efectos -------------------------------------------------
     // Orden de rig real: gate -> overdrive -> AMPLI -> nivel.
     // El overdrive va ANTES del modelo, igual que un pedal delante de un ampli.
+    // La cadena se arma SIEMPRE completa; los flags solo fijan valores iniciales
+    // y que efectos arrancan encendidos. Asi la interfaz web puede prender y
+    // apagar bloques en vivo sin reconstruir nada en el hilo de audio.
     fx::Chain chain;
 
-    if (g_gate_on) {
-        auto g = std::make_unique<fx::NoiseGate>();
-        g->setThresholdDb(g_gate_db);
-        chain.add(std::move(g));
-    }
-    if (g_od_on) {
-        auto od = std::make_unique<fx::Overdrive>();
-        od->setDrive(g_od_drive);
-        od->setTone(g_od_tone);
-        od->setLevel(g_od_level);
-        chain.add(std::move(od));
-    }
+    auto gate = std::make_unique<fx::NoiseGate>();
+    gate->setThresholdDb(g_gate_db);
+    gate->setEnabled(g_gate_on);
+    chain.add(std::move(gate));
 
-    if (g_ph_on) {
-        auto ph = std::make_unique<fx::Phaser>();
-        ph->setRateHz(g_ph_rate);
-        ph->setDepth(g_ph_depth);
-        ph->setFeedback(g_ph_fb);
-        ph->setMix(g_ph_mix);
-        ph->setStages(g_ph_stages);
-        chain.add(std::move(ph));
-    }
+    auto od = std::make_unique<fx::Overdrive>();
+    od->setDrive(g_od_drive);
+    od->setTone(g_od_tone);
+    od->setLevel(g_od_level);
+    od->setEnabled(g_od_on);
+    chain.add(std::move(od));
+
+    auto ph = std::make_unique<fx::Phaser>();
+    ph->setRateHz(g_ph_rate);
+    ph->setDepth(g_ph_depth);
+    ph->setFeedback(g_ph_fb);
+    ph->setMix(g_ph_mix);
+    ph->setStages(g_ph_stages);
+    ph->setEnabled(g_ph_on);
+    chain.add(std::move(ph));
 
     auto namFx = std::make_unique<fx::NamModel>(std::move(model));
     nam::DSP* namDsp = namFx->dsp();
     chain.add(std::move(namFx));
 
-    if (g_normalize) {
+    {
         auto gain = std::make_unique<fx::Gain>();
         const float loud = namDsp->HasLoudness()
                          ? static_cast<float>(namDsp->GetLoudness()) : g_target_db;
         gain->setGainDb(g_target_db - loud);
+        gain->setEnabled(g_normalize);
+        if (g_normalize)
+            std::cout << "Output normalization: " << (g_target_db - loud) << " dB\n";
         chain.add(std::move(gain));
-        std::cout << "Output normalization: " << (g_target_db - loud) << " dB\n";
     }
 
     // Delay y reverb van DESPUES del ampli, como en un loop de efectos.
     // Antes del ampli el delay se distorsiona y se vuelve papilla.
-    if (g_dly_on) {
-        auto d = std::make_unique<fx::Delay>();
-        d->setTimeMs(g_dly_ms);
-        d->setFeedback(g_dly_fb);
-        d->setMix(g_dly_mix);
-        d->setTone(g_dly_tone);
-        chain.add(std::move(d));
-    }
-    if (g_rev_on) {
-        auto r = std::make_unique<fx::Reverb>();
-        r->setMix(g_rev_mix);
-        r->setRoomSize(g_rev_room);
-        r->setDamp(g_rev_damp);
-        chain.add(std::move(r));
-    }
+    auto dly = std::make_unique<fx::Delay>();
+    dly->setTimeMs(g_dly_ms);
+    dly->setFeedback(g_dly_fb);
+    dly->setMix(g_dly_mix);
+    dly->setTone(g_dly_tone);
+    dly->setEnabled(g_dly_on);
+    chain.add(std::move(dly));
+
+    auto rev = std::make_unique<fx::Reverb>();
+    rev->setMix(g_rev_mix);
+    rev->setRoomSize(g_rev_room);
+    rev->setDamp(g_rev_damp);
+    rev->setEnabled(g_rev_on);
+    chain.add(std::move(rev));
 
     CallbackData callbackData;
     callbackData.chain = &chain;
@@ -721,13 +729,26 @@ int main(int argc, char** argv) {
               << "   (cushion = periods x buffer frames)\n";
     std::cout << "Chain:        ";
     if (g_bypass) std::cout << "(bypass)";
-    else for (size_t i = 0; i < chain.size(); ++i)
+    else for (size_t i = 0; i < chain.size(); ++i) {
         std::cout << (i ? " -> " : "") << chain.at(i)->name();
+        if (!chain.at(i)->enabled()) std::cout << "(off)";
+    }
     std::cout << "\n";
     std::cout << "Channels:     " << CHANNELS << " in / " << CHANNELS
               << " out (device native; guitar read from channel 1)\n";
     std::cout << "Output clamp: " << (CLAMP_OUTPUT ? "ON" : "OFF") << "\n";
     std::cout << "Model:        " << (g_bypass ? "BYPASSED (straight passthrough)" : "active") << "\n";
+    // Interfaz web. Solo escribe atomics de parametros; nunca toca el audio.
+    std::vector<fx::Param> webParams = chain.collectParams();
+    fx::WebUI web;
+    if (g_web_on) {
+        if (web.start(g_web_port, &webParams))
+            std::cout << "Web UI:       http://" << "nampedal.local:" << g_web_port
+                      << "   (" << webParams.size() << " parametros)\n";
+        else
+            std::cerr << "Web UI:       no se pudo abrir el puerto " << g_web_port << "\n";
+    }
+
     std::cout << "\nLive meters (peak over each 500ms window):\n";
     std::cout << "Press ENTER to stop...\n\n";
 
@@ -798,6 +819,7 @@ int main(int argc, char** argv) {
         std::cout << "-> Xruns occurred: raise the buffer size or check your OS config.\n";
     }
 
+    web.stop();
     audio.stopStream();
     audio.closeStream();
 

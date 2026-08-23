@@ -14,6 +14,7 @@
 #include <memory>
 #include <vector>
 #include <algorithm>
+#include "params.h"
 
 #if defined(__aarch64__)
   #include <cstdint>
@@ -86,6 +87,9 @@ public:
 
     void setEnabled(bool e) { _enabled.store(e, std::memory_order_relaxed); }
     bool enabled() const    { return _enabled.load(std::memory_order_relaxed); }
+
+    // Perillas que este efecto expone. Se llama una vez, al armar la cadena.
+    virtual void collectParams(std::vector<Param>&) {}
 private:
     std::atomic<bool> _enabled{true};
 };
@@ -105,6 +109,19 @@ public:
     }
     size_t size() const { return _fx.size(); }
     Effect* at(size_t i) { return _fx[i].get(); }
+
+    std::vector<Param> collectParams() {
+        std::vector<Param> out;
+        for (auto& e : _fx) {
+            Effect* raw = e.get();
+            out.push_back(Param{
+                std::string(raw->name()) + ".enabled", "On", "", 0.0f, 1.0f, 1.0f,
+                [raw](float v) { raw->setEnabled(v >= 0.5f); },
+                [raw]() { return raw->enabled() ? 1.0f : 0.0f; }});
+            raw->collectParams(out);
+        }
+        return out;
+    }
 private:
     std::vector<std::unique_ptr<Effect>> _fx;
 };
@@ -134,6 +151,12 @@ public:
     }
 
     void reset() override { _env = 0.0f; _gain = 0.0f; _hold = 0; }
+
+    void collectParams(std::vector<Param>& out) override {
+        out.push_back(Param{"gate.threshold", "Threshold", "dB", -80.0f, 0.0f, 0.5f,
+            [this](float v) { setThresholdDb(v); },
+            [this]() { return _thresholdDb.load(std::memory_order_relaxed); }});
+    }
 
     void process(float* buf, int n) override {
         const float openThr  = dbToGain(_thresholdDb.load(std::memory_order_relaxed));
@@ -193,6 +216,15 @@ public:
     }
 
     void reset() override { _hpX = _hpY = _lp = 0.0f; }
+
+    void collectParams(std::vector<Param>& out) override {
+        out.push_back(Param{"overdrive.drive", "Drive", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setDrive(v); }, [this]() { return _drive.target(); }});
+        out.push_back(Param{"overdrive.tone", "Tone", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setTone(v); }, [this]() { return _tone.target(); }});
+        out.push_back(Param{"overdrive.level", "Level", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setLevel(v); }, [this]() { return _level.target(); }});
+    }
 
     void process(float* buf, int n) override {
         for (int i = 0; i < n; ++i) {
@@ -264,6 +296,21 @@ public:
     void reset() override {
         for (int i = 0; i < kMaxStages; ++i) { _x1[i] = 0.0f; _y1[i] = 0.0f; }
         _phase = 0.0f; _last = 0.0f; _a = 0.0f; _counter = 0;
+    }
+
+    void collectParams(std::vector<Param>& out) override {
+        out.push_back(Param{"phaser.rate", "Rate", "Hz", 0.02f, 12.0f, 0.01f,
+            [this](float v) { setRateHz(v); },
+            [this]() { return _rate.load(std::memory_order_relaxed); }});
+        out.push_back(Param{"phaser.depth", "Depth", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setDepth(v); }, [this]() { return _depth.target(); }});
+        out.push_back(Param{"phaser.feedback", "Feedback", "", 0.0f, 0.85f, 0.01f,
+            [this](float v) { setFeedback(v); }, [this]() { return _fb.target(); }});
+        out.push_back(Param{"phaser.mix", "Mix", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setMix(v); }, [this]() { return _mix.target(); }});
+        out.push_back(Param{"phaser.stages", "Stages", "", 2.0f, 8.0f, 2.0f,
+            [this](float v) { setStages(static_cast<int>(v)); },
+            [this]() { return static_cast<float>(_stages); }});
     }
 
     void process(float* buf, int n) override {
@@ -359,6 +406,17 @@ public:
         _write = 0; _lp = 0.0f;
     }
 
+    void collectParams(std::vector<Param>& out) override {
+        out.push_back(Param{"delay.time", "Time", "ms", 1.0f, 1990.0f, 1.0f,
+            [this](float v) { setTimeMs(v); }, [this]() { return _timeMs; }});
+        out.push_back(Param{"delay.feedback", "Feedback", "", 0.0f, 0.95f, 0.01f,
+            [this](float v) { setFeedback(v); }, [this]() { return _fb.target(); }});
+        out.push_back(Param{"delay.mix", "Mix", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setMix(v); }, [this]() { return _mix.target(); }});
+        out.push_back(Param{"delay.tone", "Tone", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setTone(v); _updateTone(); }, [this]() { return _tone; }});
+    }
+
     void process(float* buf, int n) override {
         _time.set(static_cast<float>(_timeMs * 0.001 * _sr));
         for (int i = 0; i < n; ++i) {
@@ -386,6 +444,10 @@ public:
 
 private:
     static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+    void _updateTone() {
+        const float fc = 800.0f + _tone * 7200.0f;
+        _lpCoef = 1.0f - std::exp(-2.0f * kPi * fc / static_cast<float>(_sr));
+    }
     std::vector<float> _buf;
     Smoothed _fb, _mix, _time;
     double _sr = 48000.0;
@@ -410,9 +472,18 @@ class Reverb : public Effect {
 public:
     const char* name() const override { return "reverb"; }
 
-    void setRoomSize(float v) { _room.set(clampf(v, 0.0f, 1.0f) * 0.28f + 0.7f); }
-    void setDamp(float v)     { _damp.set(clampf(v, 0.0f, 1.0f) * 0.4f); }
+    void setRoomSize(float v) { _rawRoom = clampf(v, 0.0f, 1.0f); _room.set(_rawRoom * 0.28f + 0.7f); }
+    void setDamp(float v)     { _rawDamp = clampf(v, 0.0f, 1.0f); _damp.set(_rawDamp * 0.4f); }
     void setMix(float v)      { _mix.set(clampf(v, 0.0f, 1.0f)); }
+
+    void collectParams(std::vector<Param>& out) override {
+        out.push_back(Param{"reverb.mix", "Mix", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setMix(v); }, [this]() { return _mix.target(); }});
+        out.push_back(Param{"reverb.room", "Room", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setRoomSize(v); }, [this]() { return _rawRoom; }});
+        out.push_back(Param{"reverb.damp", "Damp", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setDamp(v); }, [this]() { return _rawDamp; }});
+    }
 
     void prepare(double sampleRate, int) override {
         // Las longitudes originales de Freeverb son para 44.1 kHz; se escalan.
@@ -487,6 +558,7 @@ private:
     int   _combLen[kCombs]{}, _combIdx[kCombs]{}, _apLen[kAllpass]{}, _apIdx[kAllpass]{};
     float _store[kCombs]{};
     Smoothed _room, _damp, _mix;
+    float _rawRoom = 0.6f, _rawDamp = 0.5f;
 };
 
 // ---------------------------------------------------------------------------
@@ -496,13 +568,18 @@ private:
 class Gain : public Effect {
 public:
     const char* name() const override { return "gain"; }
-    void setGainDb(float db) { _gain.set(dbToGain(db)); }
+    void setGainDb(float db) { _db = db; _gain.set(dbToGain(db)); }
+    void collectParams(std::vector<Param>& out) override {
+        out.push_back(Param{"gain.level", "Level", "dB", -24.0f, 24.0f, 0.1f,
+            [this](float v) { setGainDb(v); }, [this]() { return _db; }});
+    }
     void prepare(double sampleRate, int) override { _gain.prepare(sampleRate, 30.0); }
     void process(float* buf, int n) override {
         for (int i = 0; i < n; ++i) buf[i] *= _gain.next();
     }
 private:
     Smoothed _gain;
+    float _db = 0.0f;
 };
 
 } // namespace fx
