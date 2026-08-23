@@ -14,6 +14,7 @@
 #include <string>
 #include <fstream>
 #include <cctype>
+#include <algorithm>
 #include <filesystem>
 #include "json.hpp"
 
@@ -209,8 +210,10 @@ static std::string dbfs(float peak) {
 // Offline block-size consistency check.
 // ---------------------------------------------------------------------------
 static int runSelfTest(const std::filesystem::path& modelPath, double slim) {
-    constexpr int kSeconds   = 2;
-    constexpr int kNumFrames = 48000 * kSeconds;
+    // Length must divide evenly by every block size, or the bigger blocks leave
+    // an unprocessed tail and the comparison measures the tail, not the model.
+    // 98304 = 512 * 192, and divides by 256/128/64/32 too.
+    constexpr int kNumFrames = 98304;
     const std::vector<int> blockSizes = {512, 256, 128, 64, 32};
 
     // A steady tone: any periodic artifact stands out against it, and it makes
@@ -221,11 +224,13 @@ static int runSelfTest(const std::filesystem::path& modelPath, double slim) {
         signal[i] = 0.25f * static_cast<float>(std::sin(2.0 * 3.14159265358979 * 220.0 * t));
     }
 
-    std::cout << "Offline self-test: 220 Hz tone, " << kSeconds << " s, "
+    std::cout << "Offline self-test: 220 Hz tone, "
+              << (static_cast<double>(kNumFrames) / 48000.0) << " s, "
               << kNumFrames << " samples.\n";
     std::cout << "Processing the SAME signal at different block sizes.\n\n";
 
     std::vector<std::vector<float>> results;
+    std::vector<int> processedLen;
     for (int bs : blockSizes) {
         std::unique_ptr<nam::DSP> m;
         try {
@@ -241,28 +246,35 @@ static int runSelfTest(const std::filesystem::path& modelPath, double slim) {
 
         std::vector<float> out(kNumFrames, 0.0f);
         std::vector<float> inBlock(bs), outBlock(bs);
+        int processed = 0;
         for (int pos = 0; pos + bs <= kNumFrames; pos += bs) {
             std::memcpy(inBlock.data(), signal.data() + pos, bs * sizeof(float));
             float* ins[]  = { inBlock.data() };
             float* outs[] = { outBlock.data() };
             m->process(ins, outs, bs);
             std::memcpy(out.data() + pos, outBlock.data(), bs * sizeof(float));
+            processed = pos + bs;
         }
         results.push_back(std::move(out));
-        std::cout << "  block " << std::setw(4) << bs << " done\n";
+        processedLen.push_back(processed);
+        std::cout << "  block " << std::setw(4) << bs << " done ("
+                  << processed << " of " << kNumFrames << " samples processed)\n";
     }
 
     // Compare everything against the largest block size. Skip the first 16k
     // samples so start-up transients don't pollute the comparison.
     const int skip = 16384;
+    int common = kNumFrames;
+    for (int p : processedLen) common = std::min(common, p);
     const std::vector<float>& ref = results[0];
+    std::cout << "\n  comparing samples " << skip << " .. " << common << "\n";
     std::cout << "\n  vs block " << blockSizes[0] << ":\n";
     std::cout << std::scientific << std::setprecision(3);
     bool mismatch = false;
     for (size_t k = 1; k < results.size(); ++k) {
         double maxDiff = 0.0, sumSq = 0.0;
         long long n = 0;
-        for (int i = skip; i < kNumFrames; ++i) {
+        for (int i = skip; i < common; ++i) {
             const double d = std::fabs(static_cast<double>(results[k][i]) - ref[i]);
             if (d > maxDiff) maxDiff = d;
             sumSq += d * d;
