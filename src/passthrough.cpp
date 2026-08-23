@@ -18,7 +18,16 @@
 
 constexpr unsigned int SAMPLE_RATE   = 48000;
 constexpr unsigned int BUFFER_FRAMES = 64;
-constexpr unsigned int CHANNELS      = 1;
+
+// Open the device with its NATIVE channel count. The Scarlett (and most
+// interfaces) are stereo in / stereo out; asking RtAudio for 1 channel makes it
+// extract and re-insert a channel behind our back, and on ALSA that conversion
+// layer is where the periodic artifacts came from. We take stereo, pull channel
+// 0 out ourselves, and write the result to both outputs.
+constexpr unsigned int CHANNELS = 2;
+
+// Biggest block we are willing to handle without reallocating in the callback.
+constexpr unsigned int MAX_FRAMES = 8192;
 
 // Hard clamp on the output so samples over +/-1.0 can't wrap around in the
 // driver's float->int conversion (wrap-around is what "bit crushed" sounds like).
@@ -36,6 +45,9 @@ unsigned int g_buffer_frames = BUFFER_FRAMES;
 // --list     : print the devices and exit.
 int  g_device_id = -1;
 bool g_list_only = false;
+
+// --api alsa|jack|pulse : which backend RtAudio should use (Linux).
+std::string g_api_name = "";
 
 std::atomic<int>       g_xrun_count{0};
 std::atomic<long long> g_clip_in{0};
@@ -60,7 +72,13 @@ inline void atomicMax(std::atomic<float>& target, float value) {
 
 struct CallbackData {
     nam::DSP* model;
+    // Scratch buffers, allocated before the stream starts. Never allocate here.
+    std::vector<float> mono_in;
+    std::vector<float> mono_out;
 };
+
+// Counts blocks we had to drop because they were bigger than MAX_FRAMES.
+std::atomic<int> g_oversize_blocks{0};
 
 int audioCallback(void* outputBuffer, void* inputBuffer,
                    unsigned int nFrames, double,
@@ -77,41 +95,49 @@ int audioCallback(void* outputBuffer, void* inputBuffer,
     float* in  = static_cast<float*>(inputBuffer);
     float* out = static_cast<float*>(outputBuffer);
 
-    if (!in) {
+    if (!out) return 0;
+    if (!in || nFrames > MAX_FRAMES) {
+        if (nFrames > MAX_FRAMES) g_oversize_blocks.fetch_add(1, std::memory_order_relaxed);
         std::memset(out, 0, nFrames * CHANNELS * sizeof(float));
         return 0;
     }
 
     CallbackData* data = static_cast<CallbackData*>(userData);
+    float* mi = data->mono_in.data();
+    float* mo = data->mono_out.data();
 
-    // ---- measure the input BEFORE the model sees it -------------------------
+    // ---- de-interleave channel 0, and measure it before the model sees it ---
     float     peakIn = 0.0f;
     long long clipIn = 0;
-    for (unsigned int i = 0; i < nFrames * CHANNELS; ++i) {
-        const float a = std::fabs(in[i]);
+    for (unsigned int i = 0; i < nFrames; ++i) {
+        const float x = in[i * CHANNELS];        // channel 0 = input 1 = guitar
+        mi[i] = x;
+        const float a = std::fabs(x);
         if (a > peakIn) peakIn = a;
-        if (a >= 0.999f) ++clipIn;   // already clipped by the interface
+        if (a >= 0.999f) ++clipIn;               // already clipped by the interface
     }
 
     if (g_bypass) {
-        std::memcpy(out, in, nFrames * CHANNELS * sizeof(float));
+        std::memcpy(mo, mi, nFrames * sizeof(float));
     } else {
-        float* in_channels[]  = { in };
-        float* out_channels[] = { out };
+        float* in_channels[]  = { mi };
+        float* out_channels[] = { mo };
         data->model->process(in_channels, out_channels, static_cast<int>(nFrames));
     }
 
-    // ---- measure (and optionally clamp) what the model produced -------------
+    // ---- measure, clamp, and write the same signal to both outputs ----------
     float     peakOut = 0.0f;
     long long clipOut = 0;
-    for (unsigned int i = 0; i < nFrames * CHANNELS; ++i) {
-        const float y = out[i];
+    for (unsigned int i = 0; i < nFrames; ++i) {
+        float y = mo[i];
         const float a = std::fabs(y);
         if (a > peakOut) peakOut = a;
         if (a > 1.0f) {
             ++clipOut;
-            if (CLAMP_OUTPUT) out[i] = (y > 0.0f) ? 1.0f : -1.0f;
+            if (CLAMP_OUTPUT) y = (y > 0.0f) ? 1.0f : -1.0f;
         }
+        out[i * CHANNELS]     = y;
+        out[i * CHANNELS + 1] = y;
     }
 
     atomicMax(g_peak_in, peakIn);
@@ -157,6 +183,8 @@ int main(int argc, char** argv) {
             if (g_buffer_frames == 0) g_buffer_frames = BUFFER_FRAMES;
         } else if ((arg == "--device" || arg == "-d") && i + 1 < argc) {
             g_device_id = std::atoi(argv[++i]);
+        } else if (arg == "--api" && i + 1 < argc) {
+            g_api_name = argv[++i];
         } else {
             modelPath = arg;
         }
@@ -171,10 +199,21 @@ int main(int argc, char** argv) {
     }
     RtAudio& audio = *audioPtr;
 #else
-    // ALSA gives direct hardware access; JACK/Pulse would add their own buffering.
-    RtAudio* audioPtr = new RtAudio(RtAudio::LINUX_ALSA);
+    // ALSA talks to the hardware directly. JACK is worth trying when ALSA's
+    // duplex handling misbehaves -- it was built to keep capture and playback
+    // locked together.
+    RtAudio::Api api = RtAudio::LINUX_ALSA;
+    if      (g_api_name == "jack")  api = RtAudio::UNIX_JACK;
+    else if (g_api_name == "pulse") api = RtAudio::LINUX_PULSE;
+    else if (g_api_name == "alsa")  api = RtAudio::LINUX_ALSA;
+    else if (!g_api_name.empty()) {
+        std::cerr << "Unknown --api '" << g_api_name << "'. Use alsa, jack or pulse.\n";
+        return 1;
+    }
+
+    RtAudio* audioPtr = new RtAudio(api);
     if (audioPtr->getDeviceCount() < 1) {
-        std::cerr << "No ALSA devices found, falling back to default API.\n";
+        std::cerr << "No devices on the requested API, falling back to the default one.\n";
         delete audioPtr;
         audioPtr = new RtAudio();
     }
@@ -264,8 +303,13 @@ int main(int argc, char** argv) {
                 return (m.contains(key) && m[key].is_string()) ? m[key].get<std::string>() : std::string("?");
             };
             std::cout << "Capture name: " << field("name") << "\n";
-            std::cout << "Gear type:    " << field("gear_type")
-                      << "   (\"amp\" = no cab baked in; you need an IR after it)\n";
+            const std::string gear = field("gear_type");
+            std::cout << "Gear type:    " << gear;
+            if (gear == "amp" || gear == "preamp")
+                std::cout << "   (no cab baked in; needs an IR after it)";
+            else if (gear == "amp_cab")
+                std::cout << "   (cab included; do NOT add an IR)";
+            std::cout << "\n";
         }
     } catch (...) {
         // Metadata is a nicety; never let it stop the program.
@@ -283,7 +327,10 @@ int main(int argc, char** argv) {
                      "(brighter/darker and wrong in time).\n";
     }
 
-    CallbackData callbackData{ model.get() };
+    CallbackData callbackData;
+    callbackData.model = model.get();
+    callbackData.mono_in.assign(MAX_FRAMES, 0.0f);
+    callbackData.mono_out.assign(MAX_FRAMES, 0.0f);
 
     RtAudio::StreamParameters inParams, outParams;
     inParams.deviceId   = foundInterface ? interfaceId : audio.getDefaultInputDevice();
@@ -327,6 +374,8 @@ int main(int argc, char** argv) {
               << latencyMs << " ms\n";
     std::cout << "(actual latency also includes driver + hardware,"
                  " typically +1-3ms)\n";
+    std::cout << "Channels:     " << CHANNELS << " in / " << CHANNELS
+              << " out (device native; guitar read from channel 1)\n";
     std::cout << "Output clamp: " << (CLAMP_OUTPUT ? "ON" : "OFF") << "\n";
     std::cout << "Model:        " << (g_bypass ? "BYPASSED (straight passthrough)" : "active") << "\n";
     std::cout << "\nLive meters (peak over each 500ms window):\n";
@@ -352,6 +401,7 @@ int main(int argc, char** argv) {
 
     std::cout << "\n\n--- session summary ---\n";
     std::cout << "Xruns:            " << g_xrun_count.load() << "\n";
+    std::cout << "Oversize blocks dropped: " << g_oversize_blocks.load() << "\n";
     std::cout << "Largest block seen: " << g_max_nframes.load()
               << "  (model was Reset for " << g_reset_frames << ")\n";
     if (g_max_nframes.load() > g_reset_frames) {
