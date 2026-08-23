@@ -1,0 +1,14 @@
+# build
+build/
+out/
+.vcpkg_installed_stash/
+
+# Visual Studio / VS Code
+.vs/
+*.user
+*.suo
+*.vcxproj.user
+
+# modelos y IRs pesados (comenta esto si los quieres versionar)
+# *.nam
+# *.wav

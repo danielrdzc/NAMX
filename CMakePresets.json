@@ -1,0 +1,25 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Default (vcpkg auto-detectado)",
+      "description": "El CMakeLists busca vcpkg solo; no hace falta pasar el toolchain.",
+      "binaryDir": "${sourceDir}/build"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "default",
+      "displayName": "Release",
+      "configurePreset": "default",
+      "configuration": "Release"
+    },
+    {
+      "name": "debug",
+      "displayName": "RelWithDebInfo (optimizado + simbolos)",
+      "configurePreset": "default",
+      "configuration": "RelWithDebInfo"
+    }
+  ]
+}

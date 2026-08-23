@@ -1,0 +1,10 @@
+{
+  "name": "nam-pedal-proto",
+  "version": "0.1.0",
+  "dependencies": [
+    {
+      "name": "rtaudio",
+      "features": [ "asio" ]
+    }
+  ]
+}
