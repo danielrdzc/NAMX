@@ -54,6 +54,12 @@ std::string g_api_name = "";
 // and cheapest, 1.0 = full size. Negative means "leave the model's default".
 double g_slim = -1.0;
 
+// --selftest : no audio hardware at all. Runs the same signal through the model
+// at several block sizes and compares the outputs. A model MUST produce the same
+// result regardless of how the samples are chopped up; if it doesn't, that is
+// the bug, and this proves it without any driver in the picture.
+bool g_selftest = false;
+
 // How long model->process() takes, against the deadline the block gives us.
 // This is the number that actually decides whether the Pi can run a model:
 // RtAudio's xrun flag on ALSA stays 0 even while the card is starving.
@@ -198,6 +204,88 @@ static std::string dbfs(float peak) {
     return std::string(buf);
 }
 
+
+// ---------------------------------------------------------------------------
+// Offline block-size consistency check.
+// ---------------------------------------------------------------------------
+static int runSelfTest(const std::filesystem::path& modelPath, double slim) {
+    constexpr int kSeconds   = 2;
+    constexpr int kNumFrames = 48000 * kSeconds;
+    const std::vector<int> blockSizes = {512, 256, 128, 64, 32};
+
+    // A steady tone: any periodic artifact stands out against it, and it makes
+    // the comparison between block sizes meaningful.
+    std::vector<float> signal(kNumFrames);
+    for (int i = 0; i < kNumFrames; ++i) {
+        const double t = static_cast<double>(i) / 48000.0;
+        signal[i] = 0.25f * static_cast<float>(std::sin(2.0 * 3.14159265358979 * 220.0 * t));
+    }
+
+    std::cout << "Offline self-test: 220 Hz tone, " << kSeconds << " s, "
+              << kNumFrames << " samples.\n";
+    std::cout << "Processing the SAME signal at different block sizes.\n\n";
+
+    std::vector<std::vector<float>> results;
+    for (int bs : blockSizes) {
+        std::unique_ptr<nam::DSP> m;
+        try {
+            m = nam::get_dsp(modelPath);
+        } catch (std::exception& e) {
+            std::cerr << "Error loading model: " << e.what() << "\n";
+            return 1;
+        }
+        m->Reset(48000.0, bs);
+        if (slim >= 0.0) {
+            if (auto* sl = dynamic_cast<nam::SlimmableModel*>(m.get())) sl->SetSlimmableSize(slim);
+        }
+
+        std::vector<float> out(kNumFrames, 0.0f);
+        std::vector<float> inBlock(bs), outBlock(bs);
+        for (int pos = 0; pos + bs <= kNumFrames; pos += bs) {
+            std::memcpy(inBlock.data(), signal.data() + pos, bs * sizeof(float));
+            float* ins[]  = { inBlock.data() };
+            float* outs[] = { outBlock.data() };
+            m->process(ins, outs, bs);
+            std::memcpy(out.data() + pos, outBlock.data(), bs * sizeof(float));
+        }
+        results.push_back(std::move(out));
+        std::cout << "  block " << std::setw(4) << bs << " done\n";
+    }
+
+    // Compare everything against the largest block size. Skip the first 16k
+    // samples so start-up transients don't pollute the comparison.
+    const int skip = 16384;
+    const std::vector<float>& ref = results[0];
+    std::cout << "\n  vs block " << blockSizes[0] << ":\n";
+    std::cout << std::scientific << std::setprecision(3);
+    bool mismatch = false;
+    for (size_t k = 1; k < results.size(); ++k) {
+        double maxDiff = 0.0, sumSq = 0.0;
+        long long n = 0;
+        for (int i = skip; i < kNumFrames; ++i) {
+            const double d = std::fabs(static_cast<double>(results[k][i]) - ref[i]);
+            if (d > maxDiff) maxDiff = d;
+            sumSq += d * d;
+            ++n;
+        }
+        const double rms = (n > 0) ? std::sqrt(sumSq / n) : 0.0;
+        std::cout << "  block " << std::setw(4) << blockSizes[k]
+                  << " : max diff " << maxDiff << "   rms diff " << rms;
+        if (maxDiff > 1e-4) { std::cout << "   <-- DIFFERENT"; mismatch = true; }
+        std::cout << "\n";
+    }
+
+    std::cout << std::defaultfloat << "\n";
+    if (mismatch) {
+        std::cout << "The model's output DEPENDS on the block size. That is a bug in the\n"
+                     "inference, not in the audio path -- no driver was involved here.\n";
+    } else {
+        std::cout << "The model is block-size independent. The artifact lives in the\n"
+                     "audio path, not in the inference.\n";
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     // Args are parsed before anything else so --list can bail out early.
     std::filesystem::path modelPath = "test_model.nam";
@@ -216,9 +304,19 @@ int main(int argc, char** argv) {
             g_api_name = argv[++i];
         } else if (arg == "--slim" && i + 1 < argc) {
             g_slim = std::atof(argv[++i]);
+        } else if (arg == "--selftest") {
+            g_selftest = true;
         } else {
             modelPath = arg;
         }
+    }
+
+    if (g_selftest) {
+        if (!std::filesystem::exists(modelPath)) {
+            std::cerr << "Model file not found: " << modelPath << "\n";
+            return 1;
+        }
+        return runSelfTest(modelPath, g_slim);
     }
 
 #ifdef _WIN32
