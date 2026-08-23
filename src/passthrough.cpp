@@ -406,7 +406,17 @@ int main(int argc, char** argv) {
 
     RtAudio* audioPtr = new RtAudio(api);
     if (audioPtr->getDeviceCount() < 1) {
-        std::cerr << "No devices on the requested API, falling back to the default one.\n";
+        // Never fall back silently when the API was asked for explicitly: you end
+        // up measuring the backend you were trying to avoid and not noticing.
+        if (!g_api_name.empty()) {
+            std::cerr << "\nThe '" << g_api_name << "' API has no devices.\n";
+            if (g_api_name == "jack")
+                std::cerr << "The JACK server is not running. Start it first:\n"
+                             "  jackd -R -P 90 -d alsa -d hw:2 -r 48000 -p 64 -n 3\n"
+                             "and check it with jack_lsp before running this again.\n";
+            return 1;
+        }
+        std::cerr << "No devices on the default API, trying the fallback.\n";
         delete audioPtr;
         audioPtr = new RtAudio();
     }
