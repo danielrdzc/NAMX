@@ -1,5 +1,6 @@
 #include "RtAudio.h"
 #include "NAM/get_dsp.h"
+#include "NAM/slimmable.h"
 #include <iostream>
 #include <vector>
 #include <cstring>
@@ -48,6 +49,19 @@ bool g_list_only = false;
 
 // --api alsa|jack|pulse : which backend RtAudio should use (Linux).
 std::string g_api_name = "";
+
+// --slim V : for SlimmableContainer models, pick the submodel. 0.0 = smallest
+// and cheapest, 1.0 = full size. Negative means "leave the model's default".
+double g_slim = -1.0;
+
+// How long model->process() takes, against the deadline the block gives us.
+// This is the number that actually decides whether the Pi can run a model:
+// RtAudio's xrun flag on ALSA stays 0 even while the card is starving.
+std::atomic<long long>    g_proc_ns_total{0};
+std::atomic<long long>    g_proc_count{0};
+std::atomic<long long>    g_proc_ns_max{0};
+std::atomic<long long>    g_deadline_misses{0};
+double g_deadline_ns = 0.0;
 
 std::atomic<int>       g_xrun_count{0};
 std::atomic<long long> g_clip_in{0};
@@ -117,12 +131,27 @@ int audioCallback(void* outputBuffer, void* inputBuffer,
         if (a >= 0.999f) ++clipIn;               // already clipped by the interface
     }
 
+    const auto t0 = std::chrono::steady_clock::now();
     if (g_bypass) {
         std::memcpy(mo, mi, nFrames * sizeof(float));
     } else {
         float* in_channels[]  = { mi };
         float* out_channels[] = { mo };
         data->model->process(in_channels, out_channels, static_cast<int>(nFrames));
+    }
+    const long long elapsed_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+
+    g_proc_ns_total.fetch_add(elapsed_ns, std::memory_order_relaxed);
+    g_proc_count.fetch_add(1, std::memory_order_relaxed);
+    long long prevMaxNs = g_proc_ns_max.load(std::memory_order_relaxed);
+    while (prevMaxNs < elapsed_ns &&
+           !g_proc_ns_max.compare_exchange_weak(prevMaxNs, elapsed_ns,
+                                                std::memory_order_relaxed)) {
+    }
+    if (g_deadline_ns > 0.0 && static_cast<double>(elapsed_ns) > g_deadline_ns) {
+        g_deadline_misses.fetch_add(1, std::memory_order_relaxed);
     }
 
     // ---- measure, clamp, and write the same signal to both outputs ----------
@@ -185,6 +214,8 @@ int main(int argc, char** argv) {
             g_device_id = std::atoi(argv[++i]);
         } else if (arg == "--api" && i + 1 < argc) {
             g_api_name = argv[++i];
+        } else if (arg == "--slim" && i + 1 < argc) {
+            g_slim = std::atof(argv[++i]);
         } else {
             modelPath = arg;
         }
@@ -353,7 +384,24 @@ int main(int argc, char** argv) {
         // It must happen after openStream (bufferFrames may come back different
         // from what we asked for) and before startStream.
         g_reset_frames = bufferFrames;
+        g_deadline_ns = 1e9 * static_cast<double>(bufferFrames) / SAMPLE_RATE;
         model->Reset(static_cast<double>(SAMPLE_RATE), static_cast<int>(bufferFrames));
+
+        // Slimmable models carry several submodels at different cost/quality.
+        // Reset() first so the submodel gets the right sample rate and block size.
+        if (auto* slim = dynamic_cast<nam::SlimmableModel*>(model.get())) {
+            const auto breakpoints = slim->GetSlimmableSizeBreakpoints();
+            std::cout << "Slimmable model. Breakpoints:";
+            if (breakpoints.empty()) std::cout << " (none)";
+            for (double b : breakpoints) std::cout << " " << b;
+            std::cout << "   -- select with --slim 0.0 .. 1.0\n";
+            if (g_slim >= 0.0) {
+                slim->SetSlimmableSize(g_slim);
+                std::cout << "Slimmable size set to " << g_slim << "\n";
+            }
+        } else if (g_slim >= 0.0) {
+            std::cout << "This model is not slimmable; --slim ignored.\n";
+        }
 
         audio.startStream();
     } catch (std::exception& e) {
@@ -388,9 +436,18 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             const float pin  = g_peak_in.exchange(0.0f, std::memory_order_relaxed);
             const float pout = g_peak_out.exchange(0.0f, std::memory_order_relaxed);
+            const long long n   = g_proc_count.load();
+            const long long tot  = g_proc_ns_total.load();
+            const double avgPct  = (n > 0 && g_deadline_ns > 0.0)
+                                 ? 100.0 * (static_cast<double>(tot) / n) / g_deadline_ns : 0.0;
+            const double maxPct  = (g_deadline_ns > 0.0)
+                                 ? 100.0 * g_proc_ns_max.load() / g_deadline_ns : 0.0;
             std::cout << "\r  in " << dbfs(pin) << " dBFS   out " << dbfs(pout)
-                      << " dBFS   clipped in/out: " << g_clip_in.load() << "/"
-                      << g_clip_out.load() << "   xruns: " << g_xrun_count.load()
+                      << " dBFS   load avg/max: " << std::fixed << std::setprecision(0)
+                      << avgPct << "%/" << maxPct << "%"
+                      << "   late: " << g_deadline_misses.load()
+                      << "   clip: " << g_clip_in.load() << "/" << g_clip_out.load()
+                      << "   xruns: " << g_xrun_count.load()
                       << "        " << std::flush;
         }
     });
@@ -401,6 +458,23 @@ int main(int argc, char** argv) {
 
     std::cout << "\n\n--- session summary ---\n";
     std::cout << "Xruns:            " << g_xrun_count.load() << "\n";
+    const long long n = g_proc_count.load();
+    if (n > 0) {
+        const double avgUs = (static_cast<double>(g_proc_ns_total.load()) / n) / 1000.0;
+        const double maxUs = g_proc_ns_max.load() / 1000.0;
+        const double budgetUs = g_deadline_ns / 1000.0;
+        std::cout << std::fixed << std::setprecision(1);
+        std::cout << "Block deadline:   " << budgetUs << " us\n";
+        std::cout << "Process time:     avg " << avgUs << " us ("
+                  << (100.0 * avgUs / budgetUs) << "% of deadline), max "
+                  << maxUs << " us (" << (100.0 * maxUs / budgetUs) << "%)\n";
+        std::cout << "Blocks over deadline: " << g_deadline_misses.load()
+                  << " of " << n << "\n";
+        if (g_deadline_misses.load() > 0) {
+            std::cout << "-> The model does not fit in this block size on this machine.\n"
+                         "   Raise the buffer, or use --slim to pick a cheaper submodel.\n";
+        }
+    }
     std::cout << "Oversize blocks dropped: " << g_oversize_blocks.load() << "\n";
     std::cout << "Largest block seen: " << g_max_nframes.load()
               << "  (model was Reset for " << g_reset_frames << ")\n";
