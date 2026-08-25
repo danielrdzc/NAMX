@@ -3,6 +3,7 @@
 #include "NAM/slimmable.h"
 #include "effects.h"
 #include "nam_effect.h"
+#include "presets.h"
 #include "webui.h"
 #include <iostream>
 #include <vector>
@@ -92,6 +93,10 @@ float g_dly_fb    = 0.35f;   float g_dly_mix    = 0.3f;   float g_dly_tone = 0.5
 bool  g_rev_on    = false;   float g_rev_mix    = 0.25f;
 float g_rev_room  = 0.6f;    float g_rev_damp   = 0.5f;
 bool  g_web_on    = true;    int   g_web_port   = 8080;
+bool  g_fz_on     = false;   float g_fz_drive   = 0.6f;
+float g_fz_bias   = 0.0f;    float g_fz_tone    = 0.5f;  float g_fz_level = 0.5f;
+bool  g_tr_on     = false;   float g_tr_rate    = 4.0f;
+float g_tr_depth  = 0.6f;    float g_tr_shape   = 0.0f;
 
 
 // How long model->process() takes, against the deadline the block gives us.
@@ -427,6 +432,20 @@ int main(int argc, char** argv) {
             g_web_port = std::atoi(argv[++i]);
         } else if (arg == "--no-web") {
             g_web_on = false;
+        } else if (arg == "--fuzz" && i + 1 < argc) {
+            g_fz_on = true;    g_fz_drive = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--fuzz-bias" && i + 1 < argc) {
+            g_fz_bias = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--fuzz-tone" && i + 1 < argc) {
+            g_fz_tone = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--fuzz-level" && i + 1 < argc) {
+            g_fz_level = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--tremolo" && i + 1 < argc) {
+            g_tr_on = true;    g_tr_rate = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--tremolo-depth" && i + 1 < argc) {
+            g_tr_depth = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--tremolo-shape" && i + 1 < argc) {
+            g_tr_shape = static_cast<float>(std::atof(argv[++i]));
         } else {
             modelPath = arg;
         }
@@ -536,19 +555,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::unique_ptr<nam::DSP> model;
-    try {
-        model = nam::get_dsp(modelPath);
-    } catch (std::exception& e) {
-        std::cerr << "Error loading model: " << e.what() << "\n";
-        return 1;
-    }
-
-    if (model->NumInputChannels() != 1 || model->NumOutputChannels() != 1) {
-        std::cerr << "This prototype only supports mono 1-in/1-out models.\n";
-        return 1;
-    }
-
     std::cout << "Model loaded: " << std::filesystem::absolute(modelPath) << "\n";
 
     // Print what the capture calls itself, so there's never any doubt about
@@ -574,19 +580,6 @@ int main(int argc, char** argv) {
     } catch (...) {
         // Metadata is a nicety; never let it stop the program.
     }
-    if (model->HasLoudness()) {
-        std::cout << "Model loudness: " << model->GetLoudness() << " dB\n";
-    } else {
-        std::cout << "Model loudness: unknown\n";
-    }
-
-    const double modelRate = model->GetExpectedSampleRate();
-    if (modelRate > 0.0 && modelRate != static_cast<double>(SAMPLE_RATE)) {
-        std::cerr << "WARNING: model expects " << modelRate << " Hz but the stream runs at "
-                  << SAMPLE_RATE << " Hz. No resampling is done, so it will sound off "
-                     "(brighter/darker and wrong in time).\n";
-    }
-
     if (!g_record_path.empty()) {
         g_rec_capacity = 60 * SAMPLE_RATE;              // 60 seconds is plenty
         g_rec.assign(g_rec_capacity * 2, 0.0f);
@@ -606,6 +599,14 @@ int main(int argc, char** argv) {
     gate->setEnabled(g_gate_on);
     chain.add(std::move(gate));
 
+    auto fz = std::make_unique<fx::Fuzz>();
+    fz->setDrive(g_fz_drive);
+    fz->setBias(g_fz_bias);
+    fz->setTone(g_fz_tone);
+    fz->setLevel(g_fz_level);
+    fz->setEnabled(g_fz_on);
+    chain.add(std::move(fz));
+
     auto od = std::make_unique<fx::Overdrive>();
     od->setDrive(g_od_drive);
     od->setTone(g_od_tone);
@@ -622,20 +623,27 @@ int main(int argc, char** argv) {
     ph->setEnabled(g_ph_on);
     chain.add(std::move(ph));
 
-    auto namFx = std::make_unique<fx::NamModel>(std::move(model));
-    nam::DSP* namDsp = namFx->dsp();
+    auto namFx = std::make_unique<fx::NamModel>();
+    fx::NamModel* namPtr = namFx.get();
     chain.add(std::move(namFx));
 
     {
         auto gain = std::make_unique<fx::Gain>();
-        const float loud = namDsp->HasLoudness()
-                         ? static_cast<float>(namDsp->GetLoudness()) : g_target_db;
-        gain->setGainDb(g_target_db - loud);
+        gain->setGainDb(0.0f);
         gain->setEnabled(g_normalize);
-        if (g_normalize)
-            std::cout << "Output normalization: " << (g_target_db - loud) << " dB\n";
         chain.add(std::move(gain));
     }
+
+    // El tremolo va DESPUES del ampli: en un Fender el circuito esta entre el
+    // previo y la etapa de potencia, o sea que modula la senal ya distorsionada.
+    // Antes del ampli el resultado es otro -- la compresion del ampli aplana la
+    // modulacion y el latido casi desaparece.
+    auto tr = std::make_unique<fx::Tremolo>();
+    tr->setRateHz(g_tr_rate);
+    tr->setDepth(g_tr_depth);
+    tr->setShape(g_tr_shape);
+    tr->setEnabled(g_tr_on);
+    chain.add(std::move(tr));
 
     // Delay y reverb van DESPUES del ampli, como en un loop de efectos.
     // Antes del ampli el delay se distorsiona y se vuelve papilla.
@@ -687,9 +695,18 @@ int main(int argc, char** argv) {
         // modelo. Despues de esto, nada en el hilo de audio reserva nada.
         chain.prepare(static_cast<double>(SAMPLE_RATE), static_cast<int>(bufferFrames));
 
-        // Slimmable models carry several submodels at different cost/quality.
-        // Reset() first so the submodel gets the right sample rate and block size.
-        if (auto* slim = dynamic_cast<nam::SlimmableModel*>(namDsp)) {
+        // El modelo se carga DESPUES de prepare(): asi NamModel ya conoce el
+        // sample rate y el tamano de bloque, y puede dejarlo listo antes de
+        // publicarlo. Es el mismo camino que usa el cambio en caliente.
+        const std::string err = namPtr->loadModel(modelPath);
+        if (!err.empty()) {
+            std::cerr << "Error cargando el modelo: " << err << "\n";
+            return 1;
+        }
+        std::cout << "Model loaded: " << namPtr->path() << "\n";
+        std::cout << "Model loudness: " << namPtr->loudness() << " dB\n";
+
+        if (auto* slim = dynamic_cast<nam::SlimmableModel*>(namPtr->dsp())) {
             const auto breakpoints = slim->GetSlimmableSizeBreakpoints();
             std::cout << "Slimmable model. Breakpoints:";
             if (breakpoints.empty()) std::cout << " (none)";
@@ -739,12 +756,16 @@ int main(int argc, char** argv) {
     std::cout << "Output clamp: " << (CLAMP_OUTPUT ? "ON" : "OFF") << "\n";
     std::cout << "Model:        " << (g_bypass ? "BYPASSED (straight passthrough)" : "active") << "\n";
     // Interfaz web. Solo escribe atomics de parametros; nunca toca el audio.
-    std::vector<fx::Param> webParams = chain.collectParams();
+    // Los presets viven junto al ejecutable/proyecto, y los modelos en models/.
+    const std::string modelsDir = "models";
+    fx::Presets presets(&chain, namPtr, "presets");
+
     fx::WebUI web;
     if (g_web_on) {
-        if (web.start(g_web_port, &webParams))
-            std::cout << "Web UI:       http://" << "nampedal.local:" << g_web_port
-                      << "   (" << webParams.size() << " parametros)\n";
+        if (web.start(g_web_port, &chain, &presets, namPtr, modelsDir))
+            std::cout << "Web UI:       http://nampedal.local:" << g_web_port
+                      << "   (" << chain.collectParams().size()
+                      << " parametros, cadena reordenable, presets)\n";
         else
             std::cerr << "Web UI:       no se pudo abrir el puerto " << g_web_port << "\n";
     }

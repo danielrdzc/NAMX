@@ -14,6 +14,9 @@
 #include <memory>
 #include <vector>
 #include <algorithm>
+#include <chrono>
+#include <string>
+#include <thread>
 #include "params.h"
 
 #if defined(__aarch64__)
@@ -97,23 +100,79 @@ private:
 // ---------------------------------------------------------------------------
 // Cadena de efectos, en orden.
 // ---------------------------------------------------------------------------
+// El orden se puede cambiar en vivo. Los efectos NUNCA se mueven de _fx: lo que
+// cambia es una lista de indices. Hay dos listas y un atomico que dice cual esta
+// viva; el hilo de UI escribe SIEMPRE la que no se esta usando y luego voltea el
+// atomico. El hilo de audio lee el atomico una vez por bloque. Sin candados, sin
+// reservar memoria, y sin que el audio vea nunca una lista a medio escribir.
 class Chain {
 public:
-    void add(std::unique_ptr<Effect> e) { _fx.push_back(std::move(e)); }
+    void add(std::unique_ptr<Effect> e) {
+        _fx.push_back(std::move(e));
+        _orderA.push_back(static_cast<int>(_fx.size()) - 1);
+        _orderB = _orderA;
+    }
+
     void prepare(double sampleRate, int maxBlock) {
         for (auto& e : _fx) e->prepare(sampleRate, maxBlock);
     }
     void reset() { for (auto& e : _fx) e->reset(); }
+
     inline void process(float* buf, int n) {
-        for (auto& e : _fx) if (e->enabled()) e->process(buf, n);
+        const std::vector<int>& ord = _live.load(std::memory_order_acquire) ? _orderB : _orderA;
+        for (int idx : ord) {
+            Effect* e = _fx[static_cast<size_t>(idx)].get();
+            if (e->enabled()) e->process(buf, n);
+        }
     }
+
     size_t size() const { return _fx.size(); }
-    Effect* at(size_t i) { return _fx[i].get(); }
+
+    // En orden de senal, no en orden de construccion.
+    Effect* at(size_t pos) {
+        const std::vector<int>& ord = _live.load(std::memory_order_acquire) ? _orderB : _orderA;
+        return _fx[static_cast<size_t>(ord[pos])].get();
+    }
+
+    std::vector<std::string> order() {
+        const std::vector<int>& ord = _live.load(std::memory_order_acquire) ? _orderB : _orderA;
+        std::vector<std::string> names;
+        names.reserve(ord.size());
+        for (int i : ord) names.push_back(_fx[static_cast<size_t>(i)]->name());
+        return names;
+    }
+
+    // Devuelve false si la lista no es una permutacion exacta de los efectos.
+    // Se llama desde el hilo de control, nunca desde el de audio.
+    bool setOrder(const std::vector<std::string>& names) {
+        if (names.size() != _fx.size()) return false;
+        std::vector<int> built;
+        built.reserve(names.size());
+        for (const auto& nm : names) {
+            int found = -1;
+            for (size_t i = 0; i < _fx.size(); ++i)
+                if (nm == _fx[i]->name()) { found = static_cast<int>(i); break; }
+            if (found < 0) return false;
+            for (int b : built) if (b == found) return false;   // repetido
+            built.push_back(found);
+        }
+
+        const bool liveIsB = _live.load(std::memory_order_acquire);
+        (liveIsB ? _orderA : _orderB) = built;                  // escribir la inactiva
+        _live.store(!liveIsB, std::memory_order_release);       // y voltear
+
+        // Antes de volver a tocar la otra lista hay que dejar que el hilo de
+        // audio salga del bloque en curso. Un bloque dura microsegundos; esperar
+        // aqui es gratis para un arrastre del raton y elimina la carrera.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        return true;
+    }
 
     std::vector<Param> collectParams() {
         std::vector<Param> out;
-        for (auto& e : _fx) {
-            Effect* raw = e.get();
+        const std::vector<int>& ord = _live.load(std::memory_order_acquire) ? _orderB : _orderA;
+        for (int idx : ord) {
+            Effect* raw = _fx[static_cast<size_t>(idx)].get();
             out.push_back(Param{
                 std::string(raw->name()) + ".enabled", "On", "", 0.0f, 1.0f, 1.0f,
                 [raw](float v) { raw->setEnabled(v >= 0.5f); },
@@ -122,8 +181,11 @@ public:
         }
         return out;
     }
+
 private:
     std::vector<std::unique_ptr<Effect>> _fx;
+    std::vector<int> _orderA, _orderB;
+    std::atomic<bool> _live{false};        // false -> A, true -> B
 };
 
 // ---------------------------------------------------------------------------
@@ -559,6 +621,175 @@ private:
     float _store[kCombs]{};
     Smoothed _room, _damp, _mix;
     float _rawRoom = 0.6f, _rawDamp = 0.5f;
+};
+
+
+// ---------------------------------------------------------------------------
+// Fuzz.
+//
+// Un fuzz no es un overdrive con mas ganancia. Un overdrive redondea las puntas
+// de la onda; un fuzz las corta de tajo y convierte la senal en algo cercano a
+// una onda cuadrada. Dos cosas definen su caracter:
+//
+// 1. BIAS. En un Fuzz Face el bias es el punto de trabajo del transistor. Si se
+//    desplaza, el recorte deja de ser simetrico: la mitad positiva y la negativa
+//    se cortan a alturas distintas. Eso genera armonicos PARES, que es lo que da
+//    ese sonido vocal y nasal. Llevado al extremo, el transistor se queda sin
+//    margen y la senal se corta a pedazos -- el "starved fuzz" que escupe y se
+//    apaga entre notas. Esa aspereza es la gracia, no un defecto.
+//
+// 2. BLOQUEO DE DC. Recortar asimetricamente mete un offset de continua en la
+//    senal. Si no se quita, todo lo que venga despues trabaja descentrado: el
+//    ampli se satura antes de un lado, el gate lee mal, y el altavoz recibe DC.
+//    Por eso el bloqueador de DC despues del recorte no es opcional.
+//
+// El pasa-altos de entrada emula el capacitor de acoplamiento: sin el, los
+// graves saturan primero y el fuzz suena a manta mojada.
+// ---------------------------------------------------------------------------
+class Fuzz : public Effect {
+public:
+    const char* name() const override { return "fuzz"; }
+
+    void setDrive(float v) { _drive.set(clamp01(v)); }
+    void setBias(float v)  { _bias.set(clampf(v, -1.0f, 1.0f)); }   // 0 = simetrico
+    void setTone(float v)  { _tone.set(clamp01(v)); }
+    void setLevel(float v) { _level.set(clamp01(v)); }
+
+    void prepare(double sampleRate, int) override {
+        _sr = sampleRate;
+        _hpCoef = static_cast<float>(std::exp(-2.0 * static_cast<double>(kPi) * 100.0 / sampleRate));
+        _dcCoef = static_cast<float>(std::exp(-2.0 * static_cast<double>(kPi) * 12.0 / sampleRate));
+        _drive.prepare(sampleRate);
+        _bias.prepare(sampleRate);
+        _tone.prepare(sampleRate);
+        _level.prepare(sampleRate);
+        reset();
+    }
+
+    void reset() override { _hpX = _hpY = _dcX = _dcY = _lp = 0.0f; }
+
+    void collectParams(std::vector<Param>& out) override {
+        out.push_back(Param{"fuzz.drive", "Drive", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setDrive(v); }, [this]() { return _drive.target(); }});
+        out.push_back(Param{"fuzz.bias", "Bias", "", -1.0f, 1.0f, 0.01f,
+            [this](float v) { setBias(v); }, [this]() { return _bias.target(); }});
+        out.push_back(Param{"fuzz.tone", "Tone", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setTone(v); }, [this]() { return _tone.target(); }});
+        out.push_back(Param{"fuzz.level", "Level", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setLevel(v); }, [this]() { return _level.target(); }});
+    }
+
+    void process(float* buf, int n) override {
+        for (int i = 0; i < n; ++i) {
+            const float x = buf[i];
+
+            // capacitor de acoplamiento: fuera los graves antes de recortar
+            _hpY = _hpCoef * (_hpY + x - _hpX);
+            _hpX = x;
+
+            const float drive = _drive.next();
+            const float gain  = 2.0f + drive * drive * 200.0f;   // hasta ~200x
+            float v = _hpY * gain + _bias.next();
+
+            // recorte cubico: suave hasta +-1, y de ahi plano
+            v = clipCubic(v);
+
+            // bloqueo de DC -- obligatorio despues de un recorte asimetrico
+            _dcY = v - _dcX + _dcCoef * _dcY;
+            _dcX = v;
+            float y = _dcY;
+
+            // tono: pasa-bajos entre 700 Hz y 6 kHz
+            const float fc     = 700.0f + _tone.next() * 5300.0f;
+            const float lpCoef = 1.0f - std::exp(-2.0f * kPi * fc / static_cast<float>(_sr));
+            _lp += lpCoef * (y - _lp);
+
+            buf[i] = _lp * _level.next() * 0.6f;
+        }
+    }
+
+private:
+    static inline float clipCubic(float v) {
+        if (v >  1.0f) return  1.0f;
+        if (v < -1.0f) return -1.0f;
+        return 1.5f * v - 0.5f * v * v * v;
+    }
+    static float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+    static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+    Smoothed _drive, _bias, _tone, _level;
+    double _sr = 48000.0;
+    float _hpCoef = 0, _hpX = 0, _hpY = 0;
+    float _dcCoef = 0, _dcX = 0, _dcY = 0;
+    float _lp = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Tremolo.
+//
+// Modulacion de amplitud pura: un LFO subiendo y bajando el volumen. Lo unico
+// interesante es la FORMA de onda. El tremolo optico de un Fender es casi
+// senoidal, porque una bombilla no puede encenderse ni apagarse de golpe, y por
+// eso late suave. Los tremolos de "bias" y los digitales pueden ser cuadrados,
+// y eso pica en vez de latir.
+//
+// El parametro shape recorre de senoidal a cuadrada saturando la senoidal cada
+// vez mas. Es el mismo truco que usa un recortador, aplicado al LFO.
+// ---------------------------------------------------------------------------
+class Tremolo : public Effect {
+public:
+    const char* name() const override { return "tremolo"; }
+
+    void setRateHz(float hz) { _rate.store(clampf(hz, 0.1f, 20.0f), std::memory_order_relaxed); }
+    void setDepth(float v)   { _depth.set(clamp01(v)); }
+    void setShape(float v)   { _shape.set(clamp01(v)); }   // 0 = senoidal, 1 = cuadrada
+
+    void prepare(double sampleRate, int) override {
+        _sr = sampleRate;
+        _depth.prepare(sampleRate, 30.0);
+        _shape.prepare(sampleRate, 30.0);
+        reset();
+    }
+
+    void reset() override { _phase = 0.0f; }
+
+    void collectParams(std::vector<Param>& out) override {
+        out.push_back(Param{"tremolo.rate", "Rate", "Hz", 0.1f, 20.0f, 0.05f,
+            [this](float v) { setRateHz(v); },
+            [this]() { return _rate.load(std::memory_order_relaxed); }});
+        out.push_back(Param{"tremolo.depth", "Depth", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setDepth(v); }, [this]() { return _depth.target(); }});
+        out.push_back(Param{"tremolo.shape", "Shape", "", 0.0f, 1.0f, 0.01f,
+            [this](float v) { setShape(v); }, [this]() { return _shape.target(); }});
+    }
+
+    void process(float* buf, int n) override {
+        const float inc = _rate.load(std::memory_order_relaxed) / static_cast<float>(_sr);
+        for (int i = 0; i < n; ++i) {
+            float lfo = std::sin(2.0f * kPi * _phase);
+
+            const float shape = _shape.next();
+            if (shape > 0.001f) {
+                const float k = 1.0f + shape * 24.0f;
+                lfo = std::tanh(lfo * k) / std::tanh(k);
+            }
+
+            _phase += inc;
+            if (_phase >= 1.0f) _phase -= 1.0f;
+
+            // lfo=+1 -> volumen completo; lfo=-1 -> atenuado segun depth
+            const float g = 1.0f - _depth.next() * 0.5f * (1.0f - lfo);
+            buf[i] *= g;
+        }
+    }
+
+private:
+    static float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+    static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+    std::atomic<float> _rate{4.0f};
+    Smoothed _depth, _shape;
+    double _sr = 48000.0;
+    float _phase = 0.0f;
 };
 
 // ---------------------------------------------------------------------------
