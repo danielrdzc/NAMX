@@ -138,6 +138,13 @@ std::atomic<float>     g_peak_out{0.0f};
 // terminal y el del navegador se robarian las lecturas (ambos hacen exchange).
 std::atomic<float>     g_web_in{0.0f};
 std::atomic<float>     g_web_out{0.0f};
+// Y acumuladores de carga propios, que se vacian en cada lectura. Los globales
+// g_proc_* son ACUMULADOS desde el arranque: sirven para el resumen final, pero
+// como medidor en vivo mienten -- despues de unos minutos, encender un efecto
+// no mueve el promedio porque lo anclan millones de bloques viejos.
+std::atomic<long long> g_web_ns{0};
+std::atomic<long long> g_web_blocks{0};
+std::atomic<long long> g_web_ns_max{0};
 std::atomic<bool>      g_running{true};
 
 // Largest nFrames the callback has actually been handed. NAM sizes its internal
@@ -221,6 +228,15 @@ int audioCallback(void* outputBuffer, void* inputBuffer,
 
     g_proc_ns_total.fetch_add(elapsed_ns, std::memory_order_relaxed);
     g_proc_count.fetch_add(1, std::memory_order_relaxed);
+    g_web_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
+    g_web_blocks.fetch_add(1, std::memory_order_relaxed);
+    {
+        long long prevW = g_web_ns_max.load(std::memory_order_relaxed);
+        while (prevW < elapsed_ns &&
+               !g_web_ns_max.compare_exchange_weak(prevW, elapsed_ns,
+                                                   std::memory_order_relaxed)) {
+        }
+    }
     long long prevMaxNs = g_proc_ns_max.load(std::memory_order_relaxed);
     while (prevMaxNs < elapsed_ns &&
            !g_proc_ns_max.compare_exchange_weak(prevMaxNs, elapsed_ns,
@@ -846,16 +862,21 @@ int main(int argc, char** argv) {
     fx::WebUI web;
     if (g_web_on) {
         auto metersFn = []() {
-            const long long n   = g_proc_count.load();
-            const long long tot = g_proc_ns_total.load();
-            const double load = (n > 0 && g_deadline_ns > 0.0)
-                              ? 100.0 * (static_cast<double>(tot) / n) / g_deadline_ns : 0.0;
-            char b[256];
+            // Ventana desde la lectura anterior, no desde el arranque.
+            const long long n     = g_web_blocks.exchange(0);
+            const long long tot   = g_web_ns.exchange(0);
+            const long long mx    = g_web_ns_max.exchange(0);
+            const double load    = (n > 0 && g_deadline_ns > 0.0)
+                                 ? 100.0 * (static_cast<double>(tot) / n) / g_deadline_ns : 0.0;
+            const double loadMax = (g_deadline_ns > 0.0)
+                                 ? 100.0 * static_cast<double>(mx) / g_deadline_ns : 0.0;
+            char b[320];
             std::snprintf(b, sizeof(b),
-                "{\"in\":%.1f,\"out\":%.1f,\"load\":%.1f,\"late\":%lld,\"xruns\":%d}",
+                "{\"in\":%.1f,\"out\":%.1f,\"load\":%.1f,\"loadMax\":%.1f,"
+                "\"late\":%lld,\"xruns\":%d}",
                 20.0 * std::log10(std::max(1e-6f, g_web_in.exchange(0.0f))),
                 20.0 * std::log10(std::max(1e-6f, g_web_out.exchange(0.0f))),
-                load, g_deadline_misses.load(), g_xrun_count.load());
+                load, loadMax, g_deadline_misses.load(), g_xrun_count.load());
             return std::string(b);
         };
 

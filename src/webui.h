@@ -366,7 +366,7 @@ inline std::string WebUI::html() {
 <div class="meters" id="meters">
   <div class="m"><span class="mk">IN</span><span class="mv" id="mi">--</span></div>
   <div class="m"><span class="mk">OUT</span><span class="mv" id="mo">--</span></div>
-  <div class="m"><span class="mk">CPU</span><span class="mv" id="mc">--</span></div>
+  <div class="m"><span class="mk">CPU av/pk</span><span class="mv" id="mc">--</span></div>
   <div class="m"><span class="mk">XRUN</span><span class="mv" id="mx">--</span></div>
 </div>
 
@@ -570,7 +570,10 @@ setInterval(() => {
     put('mi', m.in <= -99 ? '--' : m.in.toFixed(0),
         m.in > -3 ? 'bad' : (m.in < -30 || m.in > -6) ? 'warn' : '');
     put('mo', m.out <= -99 ? '--' : m.out.toFixed(0), m.out > -1 ? 'bad' : '');
-    put('mc', m.load.toFixed(0) + '%', m.load > 80 ? 'bad' : m.load > 60 ? 'warn' : '');
+    // Promedio de la ventana, y pico entre parentesis: el pico es el que
+    // decide si vas a tener xruns, no el promedio.
+    put('mc', m.load.toFixed(0) + '/' + (m.loadMax || 0).toFixed(0) + '%',
+        m.loadMax > 80 ? 'bad' : m.loadMax > 60 ? 'warn' : '');
     put('mx', m.xruns + m.late, (m.xruns + m.late) > 0 ? 'bad' : '');
   }).catch(() => {});
 }, 400);
