@@ -6,6 +6,7 @@
 #include "ir.h"
 #include "tuner.h"
 #include "presets.h"
+#include "buttons.h"
 #include "webui.h"
 #include <csignal>
 #if !defined(_WIN32)
@@ -110,6 +111,13 @@ bool  g_eq_on     = false;
 // lo unico que hace falta: el preset trae el modelo adentro.
 std::string g_preset;
 std::string g_ir_path;              // --ir RUTA.wav
+
+// Botones fisicos. Numeros de GPIO, no de pin fisico.
+bool g_buttons_on   = true;
+std::string g_gpiochip = "/dev/gpiochip0";
+int  g_btn_bypass   = 5;
+int  g_btn_prev     = 27;
+int  g_btn_next     = 13;
 
 // El afinador vive fuera de la cadena: no modifica el audio, solo lo observa.
 fx::Tuner g_tuner;
@@ -484,6 +492,10 @@ int main(int argc, char** argv) {
             g_preset = argv[++i];
         } else if (arg == "--ir" && i + 1 < argc) {
             g_ir_path = argv[++i];
+        } else if (arg == "--no-buttons") {
+            g_buttons_on = false;
+        } else if (arg == "--gpiochip" && i + 1 < argc) {
+            g_gpiochip = argv[++i];
         } else if (arg == "--comp" && i + 1 < argc) {
             g_cp_on = true;    g_cp_thr = static_cast<float>(std::atof(argv[++i]));
         } else if (arg == "--comp-ratio" && i + 1 < argc) {
@@ -859,6 +871,43 @@ int main(int argc, char** argv) {
     std::cout << "Output clamp: " << (CLAMP_OUTPUT ? "ON" : "OFF") << "\n";
     std::cout << "Model:        " << (g_bypass ? "BYPASSED (straight passthrough)" : "active") << "\n";
     // Interfaz web. Solo escribe atomics de parametros; nunca toca el audio.
+    // ---- botones fisicos ---------------------------------------------------
+    // Corren en su propio hilo. Los handlers solo mueven un atomic o cargan un
+    // preset: nada de esto toca el hilo de audio.
+    fx::Buttons buttons;
+    std::atomic<int> presetIndex{0};
+
+    if (g_buttons_on && fx::Buttons::available()) {
+        auto stepPreset = [&presets, &presetIndex](int delta) {
+            const auto names = presets.list();
+            if (names.empty()) return;
+            int i = presetIndex.load() + delta;
+            while (i < 0) i += static_cast<int>(names.size());
+            i %= static_cast<int>(names.size());
+            presetIndex.store(i);
+            const std::string err = presets.load(names[static_cast<size_t>(i)]);
+            std::cout << "\n[boton] preset " << names[static_cast<size_t>(i)]
+                      << (err.empty() ? "" : "  ERROR: " + err) << std::endl;
+        };
+
+        std::vector<fx::Buttons::Def> defs = {
+            { static_cast<unsigned int>(g_btn_bypass), [] {
+                  const bool nowOn = !g_bypass;
+                  g_bypass = nowOn;
+                  std::cout << "\n[boton] bypass " << (nowOn ? "ON" : "OFF") << std::endl;
+              }},
+            { static_cast<unsigned int>(g_btn_prev), [stepPreset] { stepPreset(-1); }},
+            { static_cast<unsigned int>(g_btn_next), [stepPreset] { stepPreset(+1); }},
+        };
+
+        if (buttons.start(g_gpiochip, defs))
+            std::cout << "Botones:      GPIO " << g_btn_bypass << " (bypass), "
+                      << g_btn_prev << " (preset -), " << g_btn_next << " (preset +)\n";
+        else
+            std::cerr << "Botones:      no se pudo abrir " << g_gpiochip
+                      << " (permisos? grupo gpio?)\n";
+    }
+
     fx::WebUI web;
     if (g_web_on) {
         auto metersFn = []() {
@@ -973,6 +1022,7 @@ int main(int argc, char** argv) {
         std::cout << "-> Xruns occurred: raise the buffer size or check your OS config.\n";
     }
 
+    buttons.stop();
     web.stop();
     audio.stopStream();
     audio.closeStream();

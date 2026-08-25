@@ -119,6 +119,28 @@ else()
 endif()
 
 # ------------------------------------------------------------------------------
+# 4b. libgpiod: botones fisicos. Opcional -- si no esta, se compila sin ellos.
+# ------------------------------------------------------------------------------
+if(NOT WIN32)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(GPIOD QUIET libgpiod)
+    endif()
+    if(GPIOD_FOUND AND GPIOD_VERSION VERSION_GREATER_EQUAL 2.0)
+        target_include_directories(passthrough PRIVATE ${GPIOD_INCLUDE_DIRS})
+        target_link_libraries(passthrough PRIVATE ${GPIOD_LIBRARIES})
+        target_compile_definitions(passthrough PRIVATE NAMX_HAS_GPIOD)
+        message(STATUS "libgpiod ${GPIOD_VERSION} encontrado: botones habilitados")
+    elseif(GPIOD_FOUND)
+        message(WARNING "libgpiod ${GPIOD_VERSION} es muy vieja (hace falta 2.0+); "
+                        "se compila sin botones")
+    else()
+        message(STATUS "libgpiod no encontrado: se compila sin botones "
+                       "(sudo apt install libgpiod-dev)")
+    endif()
+endif()
+
+# ------------------------------------------------------------------------------
 # 5. Optimizacion y flags
 # ------------------------------------------------------------------------------
 if(MSVC)
