@@ -16,19 +16,21 @@
 //
 #include "effects.h"
 #include "nam_effect.h"
+#include "ir.h"
 #include "json.hpp"
 
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
+#include <cctype>
 
 namespace fx {
 
 class Presets {
 public:
-    Presets(Chain* chain, NamModel* nam, std::filesystem::path dir)
-        : _chain(chain), _nam(nam), _dir(std::move(dir)) {
+    Presets(Chain* chain, NamModel* nam, IRLoader* ir, std::filesystem::path dir)
+        : _chain(chain), _nam(nam), _ir(ir), _dir(std::move(dir)) {
         std::error_code ec;
         std::filesystem::create_directories(_dir, ec);
     }
@@ -50,6 +52,7 @@ public:
         nlohmann::json j;
         j["name"]  = name;
         j["model"] = _nam->path();
+        j["ir"]    = _ir->path();
         j["order"] = _chain->order();
 
         nlohmann::json params = nlohmann::json::object();
@@ -84,6 +87,12 @@ public:
             }
         }
 
+        // 1b. La IR: igual que el modelo, es parte del sonido base.
+        if (j.contains("ir") && j["ir"].is_string()) {
+            const std::string ir = j["ir"].get<std::string>();
+            if (ir != _ir->path()) _ir->loadIR(ir);      // vacio = descargar
+        }
+
         // 2. El orden, antes que los parametros: collectParams los devuelve en
         //    orden de senal, y queremos aplicar sobre la cadena ya acomodada.
         if (j.contains("order") && j["order"].is_array()) {
@@ -115,11 +124,21 @@ public:
 
     // Modelos disponibles, para el selector de ampli.
     std::vector<std::string> models(const std::filesystem::path& modelsDir) const {
+        return scan(modelsDir, ".nam");
+    }
+    std::vector<std::string> irs(const std::filesystem::path& irDir) const {
+        return scan(irDir, ".wav");
+    }
+
+    static std::vector<std::string> scan(const std::filesystem::path& dir,
+                                         const std::string& ext) {
         std::vector<std::string> out;
         std::error_code ec;
-        for (const auto& e : std::filesystem::directory_iterator(modelsDir, ec)) {
-            if (e.is_regular_file() && e.path().extension() == ".nam")
-                out.push_back(e.path().string());
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+            if (!e.is_regular_file()) continue;
+            std::string got = e.path().extension().string();
+            for (auto& c : got) c = static_cast<char>(std::tolower(c));
+            if (got == ext) out.push_back(e.path().string());
         }
         std::sort(out.begin(), out.end());
         return out;
@@ -138,8 +157,9 @@ private:
         return true;
     }
 
-    Chain*   _chain;
+    Chain*    _chain;
     NamModel* _nam;
+    IRLoader* _ir;
     std::filesystem::path _dir;
 };
 

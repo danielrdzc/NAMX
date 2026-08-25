@@ -1,0 +1,26 @@
+[Unit]
+Description=Servidor JACK para NAMX
+After=sound.target
+Before=namx.service
+
+[Service]
+Type=simple
+User=drdzc
+Group=audio
+
+# Sin estos dos, jackd arranca sin prioridad de tiempo real y aparecen xruns
+# que no tienen nada que ver con el DSP. Los limites de /etc/security/limits.d
+# aplican a sesiones de login: un servicio NO pasa por ahi y necesita los suyos.
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+
+# hw:USB en vez de hw:2 -- el NUMERO de tarjeta cambia entre arranques segun el
+# orden en que enumeren los dispositivos USB. El nombre no. Confirmalo con
+# 'cat /proc/asound/cards'.
+ExecStart=/usr/bin/jackd -R -P 90 -d alsa -d hw:USB -r 48000 -p 64 -n 3
+
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

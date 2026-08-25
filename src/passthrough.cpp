@@ -3,8 +3,14 @@
 #include "NAM/slimmable.h"
 #include "effects.h"
 #include "nam_effect.h"
+#include "ir.h"
+#include "tuner.h"
 #include "presets.h"
 #include "webui.h"
+#include <csignal>
+#if !defined(_WIN32)
+  #include <unistd.h>
+#endif
 #include <iostream>
 #include <vector>
 #include <cstring>
@@ -98,6 +104,19 @@ float g_fz_bias   = 0.0f;    float g_fz_tone    = 0.5f;  float g_fz_level = 0.5f
 bool  g_tr_on     = false;   float g_tr_rate    = 4.0f;
 float g_tr_depth  = 0.6f;    float g_tr_shape   = 0.0f;
 
+// --preset NOMBRE: carga un preset al arrancar. Para el servicio de systemd es
+// lo unico que hace falta: el preset trae el modelo adentro.
+std::string g_preset;
+std::string g_ir_path;              // --ir RUTA.wav
+
+// El afinador vive fuera de la cadena: no modifica el audio, solo lo observa.
+fx::Tuner g_tuner;
+
+// Cuando corre como servicio no hay stdin ni terminal. En ese caso no se puede
+// esperar un ENTER: hay que esperar a que systemd mande SIGTERM.
+std::atomic<bool> g_stop{false};
+extern "C" void onSignal(int) { g_stop.store(true); }
+
 
 // How long model->process() takes, against the deadline the block gives us.
 // This is the number that actually decides whether the Pi can run a model:
@@ -175,6 +194,11 @@ int audioCallback(void* outputBuffer, void* inputBuffer,
         if (a > peakIn) peakIn = a;
         if (a >= 0.999f) ++clipIn;               // already clipped by the interface
     }
+
+    // El afinador observa la senal seca: afinar con distorsion encima es
+    // adivinar. Aqui solo se copia a un buffer circular; el analisis pasa en
+    // otro hilo.
+    g_tuner.push(mi, static_cast<int>(nFrames));
 
     // Denormales a cero. Es por hilo, y este es el hilo de audio.
     static thread_local bool ftzDone = false;
@@ -432,6 +456,10 @@ int main(int argc, char** argv) {
             g_web_port = std::atoi(argv[++i]);
         } else if (arg == "--no-web") {
             g_web_on = false;
+        } else if (arg == "--preset" && i + 1 < argc) {
+            g_preset = argv[++i];
+        } else if (arg == "--ir" && i + 1 < argc) {
+            g_ir_path = argv[++i];
         } else if (arg == "--fuzz" && i + 1 < argc) {
             g_fz_on = true;    g_fz_drive = static_cast<float>(std::atof(argv[++i]));
         } else if (arg == "--fuzz-bias" && i + 1 < argc) {
@@ -627,6 +655,12 @@ int main(int argc, char** argv) {
     fx::NamModel* namPtr = namFx.get();
     chain.add(std::move(namFx));
 
+    // El gabinete va inmediatamente despues del ampli: es el orden fisico de un
+    // rig real, y el unico que suena bien.
+    auto irFx = std::make_unique<fx::IRLoader>();
+    fx::IRLoader* irPtr = irFx.get();
+    chain.add(std::move(irFx));
+
     {
         auto gain = std::make_unique<fx::Gain>();
         gain->setGainDb(0.0f);
@@ -662,6 +696,11 @@ int main(int argc, char** argv) {
     rev->setEnabled(g_rev_on);
     chain.add(std::move(rev));
 
+    // Los presets viven junto al proyecto, y los modelos en models/.
+    const std::string modelsDir = "models";
+    const std::string irDir     = "irs";
+    fx::Presets presets(&chain, namPtr, irPtr, "presets");
+
     CallbackData callbackData;
     callbackData.chain = &chain;
     callbackData.mono_in.assign(MAX_FRAMES, 0.0f);
@@ -694,17 +733,39 @@ int main(int argc, char** argv) {
         // prepare() reserva toda la memoria de la cadena y hace el Reset del
         // modelo. Despues de esto, nada en el hilo de audio reserva nada.
         chain.prepare(static_cast<double>(SAMPLE_RATE), static_cast<int>(bufferFrames));
+        g_tuner.prepare(static_cast<double>(SAMPLE_RATE));
 
         // El modelo se carga DESPUES de prepare(): asi NamModel ya conoce el
         // sample rate y el tamano de bloque, y puede dejarlo listo antes de
         // publicarlo. Es el mismo camino que usa el cambio en caliente.
-        const std::string err = namPtr->loadModel(modelPath);
-        if (!err.empty()) {
-            std::cerr << "Error cargando el modelo: " << err << "\n";
-            return 1;
+        // Un preset trae su propio modelo, asi que se intenta primero. El
+        // argumento posicional queda como respaldo.
+        bool ready = false;
+        if (!g_preset.empty()) {
+            const std::string perr = presets.load(g_preset);
+            if (perr.empty() && namPtr->dsp()) {
+                std::cout << "Preset cargado: " << g_preset << "\n";
+                ready = true;
+            } else {
+                std::cerr << "No se pudo cargar el preset '" << g_preset
+                          << "': " << perr << "\n";
+            }
         }
+        if (!ready) {
+            const std::string err = namPtr->loadModel(modelPath);
+            if (!err.empty()) {
+                std::cerr << "Error cargando el modelo: " << err << "\n";
+                return 1;
+            }
+        }
+        if (!g_ir_path.empty()) {
+            const std::string ierr = irPtr->loadIR(g_ir_path);
+            if (!ierr.empty()) std::cerr << "IR: " << ierr << "\n";
+        }
+
         std::cout << "Model loaded: " << namPtr->path() << "\n";
         std::cout << "Model loudness: " << namPtr->loudness() << " dB\n";
+        if (!irPtr->path().empty()) std::cout << "IR loaded:    " << irPtr->path() << "\n";
 
         if (auto* slim = dynamic_cast<nam::SlimmableModel*>(namPtr->dsp())) {
             const auto breakpoints = slim->GetSlimmableSizeBreakpoints();
@@ -756,13 +817,10 @@ int main(int argc, char** argv) {
     std::cout << "Output clamp: " << (CLAMP_OUTPUT ? "ON" : "OFF") << "\n";
     std::cout << "Model:        " << (g_bypass ? "BYPASSED (straight passthrough)" : "active") << "\n";
     // Interfaz web. Solo escribe atomics de parametros; nunca toca el audio.
-    // Los presets viven junto al ejecutable/proyecto, y los modelos en models/.
-    const std::string modelsDir = "models";
-    fx::Presets presets(&chain, namPtr, "presets");
-
     fx::WebUI web;
     if (g_web_on) {
-        if (web.start(g_web_port, &chain, &presets, namPtr, modelsDir))
+        if (web.start(g_web_port, &chain, &presets, namPtr, irPtr, &g_tuner,
+                      modelsDir, irDir))
             std::cout << "Web UI:       http://nampedal.local:" << g_web_port
                       << "   (" << chain.collectParams().size()
                       << " parametros, cadena reordenable, presets)\n";
@@ -770,35 +828,49 @@ int main(int argc, char** argv) {
             std::cerr << "Web UI:       no se pudo abrir el puerto " << g_web_port << "\n";
     }
 
-    std::cout << "\nLive meters (peak over each 500ms window):\n";
-    std::cout << "Press ENTER to stop...\n\n";
+    // Con terminal: medidores en vivo y ENTER para salir.
+    // Como servicio: sin medidores (llenarian el journal) y se espera SIGTERM.
+#if defined(_WIN32)
+    const bool interactive = true;
+#else
+    const bool interactive = ::isatty(fileno(stdin)) != 0;
+#endif
 
-    // Meter thread. Reads the peaks the callback records and resets them, so
-    // each line is the peak of the last window rather than of the whole run.
-    std::thread meter([]() {
-        while (g_running.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            const float pin  = g_peak_in.exchange(0.0f, std::memory_order_relaxed);
-            const float pout = g_peak_out.exchange(0.0f, std::memory_order_relaxed);
-            const long long n   = g_proc_count.load();
-            const long long tot  = g_proc_ns_total.load();
-            const double avgPct  = (n > 0 && g_deadline_ns > 0.0)
-                                 ? 100.0 * (static_cast<double>(tot) / n) / g_deadline_ns : 0.0;
-            const double maxPct  = (g_deadline_ns > 0.0)
-                                 ? 100.0 * g_proc_ns_max.load() / g_deadline_ns : 0.0;
-            std::cout << "\r  in " << dbfs(pin) << " dBFS   out " << dbfs(pout)
-                      << " dBFS   load avg/max: " << std::fixed << std::setprecision(0)
-                      << avgPct << "%/" << maxPct << "%"
-                      << "   late: " << g_deadline_misses.load()
-                      << "   clip: " << g_clip_in.load() << "/" << g_clip_out.load()
-                      << "   xruns: " << g_xrun_count.load()
-                      << "        " << std::flush;
-        }
-    });
+    std::signal(SIGINT,  onSignal);
+    std::signal(SIGTERM, onSignal);
 
-    std::cin.get();
+    std::thread meter;
+    if (interactive) {
+        std::cout << "\nLive meters (peak over each 500ms window):\n";
+        std::cout << "Press ENTER to stop...\n\n";
+        meter = std::thread([]() {
+            while (g_running.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                const float pin  = g_peak_in.exchange(0.0f, std::memory_order_relaxed);
+                const float pout = g_peak_out.exchange(0.0f, std::memory_order_relaxed);
+                const long long n   = g_proc_count.load();
+                const long long tot = g_proc_ns_total.load();
+                const double avgPct = (n > 0 && g_deadline_ns > 0.0)
+                                    ? 100.0 * (static_cast<double>(tot) / n) / g_deadline_ns : 0.0;
+                const double maxPct = (g_deadline_ns > 0.0)
+                                    ? 100.0 * g_proc_ns_max.load() / g_deadline_ns : 0.0;
+                std::cout << "\r  in " << dbfs(pin) << " dBFS   out " << dbfs(pout)
+                          << " dBFS   load avg/max: " << std::fixed << std::setprecision(0)
+                          << avgPct << "%/" << maxPct << "%"
+                          << "   late: " << g_deadline_misses.load()
+                          << "   clip: " << g_clip_in.load() << "/" << g_clip_out.load()
+                          << "   xruns: " << g_xrun_count.load()
+                          << "        " << std::flush;
+            }
+        });
+        std::cin.get();
+    } else {
+        std::cout << "\nCorriendo como servicio. Esperando SIGTERM." << std::endl;
+        while (!g_stop.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
     g_running.store(false, std::memory_order_relaxed);
-    meter.join();
+    if (meter.joinable()) meter.join();
 
     std::cout << "\n\n--- session summary ---\n";
     std::cout << "Xruns:            " << g_xrun_count.load() << "\n";

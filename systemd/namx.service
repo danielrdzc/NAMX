@@ -1,0 +1,27 @@
+[Unit]
+Description=Pedal NAMX
+Requires=namx-jack.service
+After=namx-jack.service
+
+[Service]
+Type=simple
+User=drdzc
+Group=audio
+
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+
+# models/ y presets/ se resuelven relativo a este directorio.
+WorkingDirectory=/home/drdzc/NAMX
+
+# El preset trae su propio modelo, asi que es lo unico que hay que nombrar.
+ExecStart=/home/drdzc/NAMX/build/passthrough --api jack --preset default
+
+# jackd tarda un momento en aceptar clientes despues de arrancar. Si el pedal
+# llega antes, se muere y systemd lo reintenta -- por eso Restart=always con
+# una espera corta: se resuelve solo en el segundo intento.
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

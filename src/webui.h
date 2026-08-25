@@ -16,6 +16,7 @@
 #include "nam_effect.h"
 #include "params.h"
 #include "presets.h"
+#include "tuner.h"
 
 #include <atomic>
 #include <cstdio>
@@ -40,7 +41,8 @@ public:
     ~WebUI() { stop(); }
 
 #if defined(_WIN32)
-    bool start(int, Chain*, Presets*, NamModel*, const std::string&) {
+    bool start(int, Chain*, Presets*, NamModel*, IRLoader*, Tuner*,
+               const std::string&, const std::string&) {
         std::printf("Web UI: no disponible en la compilacion de Windows.\n");
         return false;
     }
@@ -48,8 +50,10 @@ public:
 #else
 
     bool start(int port, Chain* chain, Presets* presets, NamModel* nam,
-               const std::string& modelsDir) {
-        _chain = chain; _presets = presets; _nam = nam; _modelsDir = modelsDir;
+               IRLoader* ir, Tuner* tuner,
+               const std::string& modelsDir, const std::string& irDir) {
+        _chain = chain; _presets = presets; _nam = nam; _ir = ir; _tuner = tuner;
+        _modelsDir = modelsDir; _irDir = irDir;
         _fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (_fd < 0) return false;
 
@@ -124,6 +128,9 @@ private:
                                                     result(_presets->remove(urlDecode(field(query,"name")))));
         else if (path == "/api/model/load")    send(c, "application/json",
                                                     result(_nam->loadModel(urlDecode(field(query,"path")))));
+        else if (path == "/api/ir/load")       send(c, "application/json",
+                                                    result(_ir->loadIR(urlDecode(field(query,"path")))));
+        else if (path == "/api/tuner")         send(c, "application/json", tunerJson());
         else                             sendStatus(c, "404 Not Found", "text/plain", "no");
     }
 
@@ -155,11 +162,24 @@ private:
                            : "{\"ok\":false,\"error\":\"" + jsonEscape(err) + "\"}";
     }
 
+    std::string tunerJson() {
+        const TunerReading t = _tuner->detect();
+        char b[256];
+        std::snprintf(b, sizeof(b),
+            "{\"valid\":%s,\"freq\":%.2f,\"cents\":%.1f,\"clarity\":%.2f,\"note\":\"%s\"}",
+            t.valid ? "true" : "false", t.freq, t.cents, t.clarity, t.note.c_str());
+        return b;
+    }
+
     std::string stateJson() {
         std::string j = "{\"model\":\"" + jsonEscape(_nam->path()) + "\",\"models\":[";
         const auto ms = _presets->models(_modelsDir);
         for (size_t i = 0; i < ms.size(); ++i)
             j += (i ? "," : "") + std::string("\"") + jsonEscape(ms[i]) + "\"";
+        j += "],\"ir\":\"" + jsonEscape(_ir->path()) + "\",\"irs\":[";
+        const auto is = _presets->irs(_irDir);
+        for (size_t i = 0; i < is.size(); ++i)
+            j += (i ? "," : "") + std::string("\"") + jsonEscape(is[i]) + "\"";
         j += "],\"presets\":[";
         const auto ps = _presets->list();
         for (size_t i = 0; i < ps.size(); ++i)
@@ -242,7 +262,9 @@ private:
     Chain*    _chain   = nullptr;
     Presets*  _presets = nullptr;
     NamModel* _nam     = nullptr;
-    std::string _modelsDir;
+    IRLoader* _ir      = nullptr;
+    Tuner*    _tuner   = nullptr;
+    std::string _modelsDir, _irDir;
 #endif
 };
 
@@ -296,6 +318,19 @@ inline std::string WebUI::html() {
   .prow select { flex:1; margin-bottom:0; }
   .msg { color:#8a8c92; font-size:12px; min-height:16px; margin-top:9px; }
   .msg.err { color:#ff6b6b; }
+  .tuner { background:#191a1d; border:1px solid #26272b; border-radius:11px;
+           padding:14px; margin-bottom:18px; text-align:center; }
+  .tnote { font-size:34px; font-weight:700; letter-spacing:.02em; line-height:1.1;
+           color:#5a5c62; font-variant-numeric:tabular-nums; }
+  .tnote.ok { color:#4ade80; }
+  .tbar { position:relative; height:8px; background:#0e0e10; border-radius:999px;
+          margin:10px 0 7px; overflow:hidden; }
+  .tcenter { position:absolute; left:50%; top:0; width:2px; height:100%;
+             background:#3a3b40; transform:translateX(-1px); }
+  .tneedle { position:absolute; top:0; width:4px; height:100%; border-radius:2px;
+             background:var(--ac); left:50%; transform:translateX(-2px);
+             transition:left .08s linear; }
+  .tinfo { color:#8a8c92; font-size:11.5px; letter-spacing:.05em; }
 </style>
 <h1>NAMX</h1>
 <div class="sub">Arrastra los bloques por el asa para reordenar la cadena.</div>
@@ -303,6 +338,8 @@ inline std::string WebUI::html() {
 <div class="bar">
   <label class="bl">Ampli</label>
   <select id="model"></select>
+  <label class="bl">Gabinete (IR)</label>
+  <select id="ir"></select>
   <label class="bl">Preset</label>
   <div class="prow">
     <select id="preset"></select>
@@ -310,6 +347,12 @@ inline std::string WebUI::html() {
     <button id="bsave">Guardar</button>
   </div>
   <div id="msg" class="msg"></div>
+</div>
+
+<div class="tuner" id="tuner">
+  <div class="tnote" id="tnote">--</div>
+  <div class="tbar"><div class="tneedle" id="tneedle"></div><div class="tcenter"></div></div>
+  <div class="tinfo" id="tinfo">afinador</div>
 </div>
 
 <div class="end">GUITARRA</div>
@@ -442,6 +485,7 @@ function build(params) {
 const msg = document.getElementById('msg');
 const elModel = document.getElementById('model');
 const elPreset = document.getElementById('preset');
+const elIr = document.getElementById('ir');
 
 function say(text, isErr) {
   msg.textContent = text;
@@ -466,6 +510,10 @@ function refreshState() {
   return fetch('/api/state').then(r => r.json()).then(st => {
     fill(elModel, st.models, st.model);
     fill(elPreset, st.presets, null);
+    // La opcion vacia permite quitar la IR: los captures "amp_cab" ya traen
+    // gabinete y ponerles una IR encima seria apilar dos.
+    fill(elIr, [''].concat(st.irs), st.ir);
+    if (elIr.options.length) elIr.options[0].textContent = '(ninguno)';
   });
 }
 
@@ -478,6 +526,38 @@ elModel.onchange = () => {
     .then(r => r.json())
     .then(r => { say(r.ok ? 'Ampli cargado' : r.error, !r.ok); });
 };
+
+elIr.onchange = () => {
+  say('Cargando IR...');
+  fetch('/api/ir/load?path=' + encodeURIComponent(elIr.value))
+    .then(r => r.json())
+    .then(r => { say(r.ok ? (elIr.value ? 'IR cargada' : 'IR quitada') : r.error, !r.ok);
+                 refreshParams(); });
+};
+
+const tnote = document.getElementById('tnote');
+const tneedle = document.getElementById('tneedle');
+const tinfo = document.getElementById('tinfo');
+
+setInterval(() => {
+  fetch('/api/tuner').then(r => r.json()).then(t => {
+    if (!t.valid) {
+      tnote.textContent = '--';
+      tnote.className = 'tnote';
+      tinfo.textContent = 'toca una cuerda al aire';
+      tneedle.style.left = '50%';
+      return;
+    }
+    tnote.textContent = t.note;
+    // +-50 cents ocupan todo el ancho de la barra
+    const pos = Math.max(-50, Math.min(50, t.cents));
+    tneedle.style.left = (50 + pos) + '%';
+    const inTune = Math.abs(t.cents) < 5;
+    tnote.className = 'tnote' + (inTune ? ' ok' : '');
+    tinfo.textContent = t.freq.toFixed(1) + ' Hz   ' +
+                        (t.cents >= 0 ? '+' : '') + t.cents.toFixed(0) + ' cents';
+  }).catch(() => {});
+}, 250);
 
 document.getElementById('bload').onclick = () => {
   if (!elPreset.value) return;
