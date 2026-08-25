@@ -17,6 +17,7 @@
 #include "params.h"
 #include "presets.h"
 #include "tuner.h"
+#include <functional>
 
 #include <atomic>
 #include <cstdio>
@@ -42,7 +43,7 @@ public:
 
 #if defined(_WIN32)
     bool start(int, Chain*, Presets*, NamModel*, IRLoader*, Tuner*,
-               const std::string&, const std::string&) {
+               const std::string&, const std::string&, std::function<std::string()>) {
         std::printf("Web UI: no disponible en la compilacion de Windows.\n");
         return false;
     }
@@ -51,9 +52,10 @@ public:
 
     bool start(int port, Chain* chain, Presets* presets, NamModel* nam,
                IRLoader* ir, Tuner* tuner,
-               const std::string& modelsDir, const std::string& irDir) {
+               const std::string& modelsDir, const std::string& irDir,
+               std::function<std::string()> metersFn) {
         _chain = chain; _presets = presets; _nam = nam; _ir = ir; _tuner = tuner;
-        _modelsDir = modelsDir; _irDir = irDir;
+        _modelsDir = modelsDir; _irDir = irDir; _metersFn = std::move(metersFn);
         _fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (_fd < 0) return false;
 
@@ -131,6 +133,8 @@ private:
         else if (path == "/api/ir/load")       send(c, "application/json",
                                                     result(_ir->loadIR(urlDecode(field(query,"path")))));
         else if (path == "/api/tuner")         send(c, "application/json", tunerJson());
+        else if (path == "/api/meters")        send(c, "application/json",
+                                                    _metersFn ? _metersFn() : "{}");
         else                             sendStatus(c, "404 Not Found", "text/plain", "no");
     }
 
@@ -265,6 +269,7 @@ private:
     IRLoader* _ir      = nullptr;
     Tuner*    _tuner   = nullptr;
     std::string _modelsDir, _irDir;
+    std::function<std::string()> _metersFn;
 #endif
 };
 
@@ -318,6 +323,15 @@ inline std::string WebUI::html() {
   .prow select { flex:1; margin-bottom:0; }
   .msg { color:#8a8c92; font-size:12px; min-height:16px; margin-top:9px; }
   .msg.err { color:#ff6b6b; }
+  .meters { display:grid; grid-template-columns:repeat(4,1fr); gap:8px;
+            margin-bottom:12px; }
+  .m { background:#191a1d; border:1px solid #26272b; border-radius:9px;
+       padding:8px 6px; text-align:center; }
+  .mk { display:block; color:#6b6d73; font-size:9.5px; letter-spacing:.12em; }
+  .mv { display:block; color:var(--ac); font-size:14px; font-weight:600;
+        font-variant-numeric:tabular-nums; margin-top:3px; }
+  .mv.warn { color:#fbbf24; }
+  .mv.bad  { color:#ff6b6b; }
   .tuner { background:#191a1d; border:1px solid #26272b; border-radius:11px;
            padding:14px; margin-bottom:18px; text-align:center; }
   .tnote { font-size:34px; font-weight:700; letter-spacing:.02em; line-height:1.1;
@@ -347,6 +361,13 @@ inline std::string WebUI::html() {
     <button id="bsave">Guardar</button>
   </div>
   <div id="msg" class="msg"></div>
+</div>
+
+<div class="meters" id="meters">
+  <div class="m"><span class="mk">IN</span><span class="mv" id="mi">--</span></div>
+  <div class="m"><span class="mk">OUT</span><span class="mv" id="mo">--</span></div>
+  <div class="m"><span class="mk">CPU</span><span class="mv" id="mc">--</span></div>
+  <div class="m"><span class="mk">XRUN</span><span class="mv" id="mx">--</span></div>
 </div>
 
 <div class="tuner" id="tuner">
@@ -538,6 +559,21 @@ elIr.onchange = () => {
 const tnote = document.getElementById('tnote');
 const tneedle = document.getElementById('tneedle');
 const tinfo = document.getElementById('tinfo');
+
+setInterval(() => {
+  fetch('/api/meters').then(r => r.json()).then(m => {
+    const put = (id, txt, cls) => {
+      const el = document.getElementById(id);
+      el.textContent = txt; el.className = 'mv' + (cls ? ' ' + cls : '');
+    };
+    // Rango sano de entrada: -18 a -6 dBFS. Fuera de ahi, avisar.
+    put('mi', m.in <= -99 ? '--' : m.in.toFixed(0),
+        m.in > -3 ? 'bad' : (m.in < -30 || m.in > -6) ? 'warn' : '');
+    put('mo', m.out <= -99 ? '--' : m.out.toFixed(0), m.out > -1 ? 'bad' : '');
+    put('mc', m.load.toFixed(0) + '%', m.load > 80 ? 'bad' : m.load > 60 ? 'warn' : '');
+    put('mx', m.xruns + m.late, (m.xruns + m.late) > 0 ? 'bad' : '');
+  }).catch(() => {});
+}, 400);
 
 setInterval(() => {
   fetch('/api/tuner').then(r => r.json()).then(t => {

@@ -103,6 +103,8 @@ bool  g_fz_on     = false;   float g_fz_drive   = 0.6f;
 float g_fz_bias   = 0.0f;    float g_fz_tone    = 0.5f;  float g_fz_level = 0.5f;
 bool  g_tr_on     = false;   float g_tr_rate    = 4.0f;
 float g_tr_depth  = 0.6f;    float g_tr_shape   = 0.0f;
+bool  g_cp_on     = false;   float g_cp_thr     = -18.0f;  float g_cp_ratio = 4.0f;
+bool  g_eq_on     = false;
 
 // --preset NOMBRE: carga un preset al arrancar. Para el servicio de systemd es
 // lo unico que hace falta: el preset trae el modelo adentro.
@@ -132,6 +134,10 @@ std::atomic<long long> g_clip_in{0};
 std::atomic<long long> g_clip_out{0};
 std::atomic<float>     g_peak_in{0.0f};
 std::atomic<float>     g_peak_out{0.0f};
+// Copias aparte para la web. Si compartieran las de arriba, el medidor de la
+// terminal y el del navegador se robarian las lecturas (ambos hacen exchange).
+std::atomic<float>     g_web_in{0.0f};
+std::atomic<float>     g_web_out{0.0f};
 std::atomic<bool>      g_running{true};
 
 // Largest nFrames the callback has actually been handed. NAM sizes its internal
@@ -254,6 +260,8 @@ int audioCallback(void* outputBuffer, void* inputBuffer,
 
     atomicMax(g_peak_in, peakIn);
     atomicMax(g_peak_out, peakOut);
+    atomicMax(g_web_in, peakIn);
+    atomicMax(g_web_out, peakOut);
     if (clipIn)  g_clip_in.fetch_add(clipIn, std::memory_order_relaxed);
     if (clipOut) g_clip_out.fetch_add(clipOut, std::memory_order_relaxed);
 
@@ -460,6 +468,12 @@ int main(int argc, char** argv) {
             g_preset = argv[++i];
         } else if (arg == "--ir" && i + 1 < argc) {
             g_ir_path = argv[++i];
+        } else if (arg == "--comp" && i + 1 < argc) {
+            g_cp_on = true;    g_cp_thr = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--comp-ratio" && i + 1 < argc) {
+            g_cp_ratio = static_cast<float>(std::atof(argv[++i]));
+        } else if (arg == "--eq") {
+            g_eq_on = true;
         } else if (arg == "--fuzz" && i + 1 < argc) {
             g_fz_on = true;    g_fz_drive = static_cast<float>(std::atof(argv[++i]));
         } else if (arg == "--fuzz-bias" && i + 1 < argc) {
@@ -642,6 +656,12 @@ int main(int argc, char** argv) {
     od->setEnabled(g_od_on);
     chain.add(std::move(od));
 
+    auto comp = std::make_unique<fx::Compressor>();
+    comp->setEnabled(g_cp_on);
+    comp->setThresholdDb(g_cp_thr);
+    comp->setRatio(g_cp_ratio);
+    chain.add(std::move(comp));
+
     auto ph = std::make_unique<fx::Phaser>();
     ph->setRateHz(g_ph_rate);
     ph->setDepth(g_ph_depth);
@@ -660,6 +680,12 @@ int main(int argc, char** argv) {
     auto irFx = std::make_unique<fx::IRLoader>();
     fx::IRLoader* irPtr = irFx.get();
     chain.add(std::move(irFx));
+
+    // El EQ va despues del gabinete: es el equivalente a ecualizar el microfono,
+    // que es donde se hace en un estudio.
+    auto eq = std::make_unique<fx::EQ>();
+    eq->setEnabled(g_eq_on);
+    chain.add(std::move(eq));
 
     {
         auto gain = std::make_unique<fx::Gain>();
@@ -819,8 +845,22 @@ int main(int argc, char** argv) {
     // Interfaz web. Solo escribe atomics de parametros; nunca toca el audio.
     fx::WebUI web;
     if (g_web_on) {
+        auto metersFn = []() {
+            const long long n   = g_proc_count.load();
+            const long long tot = g_proc_ns_total.load();
+            const double load = (n > 0 && g_deadline_ns > 0.0)
+                              ? 100.0 * (static_cast<double>(tot) / n) / g_deadline_ns : 0.0;
+            char b[256];
+            std::snprintf(b, sizeof(b),
+                "{\"in\":%.1f,\"out\":%.1f,\"load\":%.1f,\"late\":%lld,\"xruns\":%d}",
+                20.0 * std::log10(std::max(1e-6f, g_web_in.exchange(0.0f))),
+                20.0 * std::log10(std::max(1e-6f, g_web_out.exchange(0.0f))),
+                load, g_deadline_misses.load(), g_xrun_count.load());
+            return std::string(b);
+        };
+
         if (web.start(g_web_port, &chain, &presets, namPtr, irPtr, &g_tuner,
-                      modelsDir, irDir))
+                      modelsDir, irDir, metersFn))
             std::cout << "Web UI:       http://nampedal.local:" << g_web_port
                       << "   (" << chain.collectParams().size()
                       << " parametros, cadena reordenable, presets)\n";

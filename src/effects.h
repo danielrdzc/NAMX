@@ -188,6 +188,242 @@ private:
     std::atomic<bool> _live{false};        // false -> A, true -> B
 };
 
+
+// ---------------------------------------------------------------------------
+// Biquad (forma directa II transpuesta).
+//
+// Los coeficientes NO se recalculan al mover una perilla desde el hilo web:
+// escribir cinco floats sin atomicidad puede dejar el filtro con una mezcla de
+// coeficientes viejos y nuevos, y un biquad con coeficientes incoherentes puede
+// volverse inestable y explotar. En vez de eso, el setter marca "sucio" y el
+// recalculo pasa al principio del bloque, en el hilo de audio. Cuesta un par de
+// sin/cos por bloque -- nada -- y es imposible que quede a medias.
+// ---------------------------------------------------------------------------
+struct Biquad {
+    float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+    float z1 = 0, z2 = 0;
+
+    inline float process(float x) {
+        const float y = b0 * x + z1;
+        z1 = b1 * x - a1 * y + z2;
+        z2 = b2 * x - a2 * y;
+        return y;
+    }
+    void reset() { z1 = z2 = 0; }
+
+    void lowpass(double sr, double f0, double q) {
+        const double w = 2.0 * kPi * f0 / sr, c = std::cos(w), al = std::sin(w) / (2.0 * q);
+        const double a0 = 1 + al;
+        set((1 - c) / 2 / a0, (1 - c) / a0, (1 - c) / 2 / a0, -2 * c / a0, (1 - al) / a0);
+    }
+    void lowShelf(double sr, double f0, double gainDb) {
+        const double A = std::pow(10.0, gainDb / 40.0);
+        const double w = 2.0 * kPi * f0 / sr, c = std::cos(w), s = std::sin(w);
+        const double al = s / 2.0 * std::sqrt((A + 1 / A) * (1 / 0.9 - 1) + 2);
+        const double sq = 2 * std::sqrt(A) * al;
+        const double a0 = (A + 1) + (A - 1) * c + sq;
+        set(A * ((A + 1) - (A - 1) * c + sq) / a0,
+            2 * A * ((A - 1) - (A + 1) * c) / a0,
+            A * ((A + 1) - (A - 1) * c - sq) / a0,
+            -2 * ((A - 1) + (A + 1) * c) / a0,
+            ((A + 1) + (A - 1) * c - sq) / a0);
+    }
+    void highShelf(double sr, double f0, double gainDb) {
+        const double A = std::pow(10.0, gainDb / 40.0);
+        const double w = 2.0 * kPi * f0 / sr, c = std::cos(w), s = std::sin(w);
+        const double al = s / 2.0 * std::sqrt((A + 1 / A) * (1 / 0.9 - 1) + 2);
+        const double sq = 2 * std::sqrt(A) * al;
+        const double a0 = (A + 1) - (A - 1) * c + sq;
+        set(A * ((A + 1) + (A - 1) * c + sq) / a0,
+            -2 * A * ((A - 1) + (A + 1) * c) / a0,
+            A * ((A + 1) + (A - 1) * c - sq) / a0,
+            2 * ((A - 1) - (A + 1) * c) / a0,
+            ((A + 1) - (A - 1) * c - sq) / a0);
+    }
+    void peaking(double sr, double f0, double q, double gainDb) {
+        const double A = std::pow(10.0, gainDb / 40.0);
+        const double w = 2.0 * kPi * f0 / sr, c = std::cos(w), al = std::sin(w) / (2.0 * q);
+        const double a0 = 1 + al / A;
+        set((1 + al * A) / a0, -2 * c / a0, (1 - al * A) / a0,
+            -2 * c / a0, (1 - al / A) / a0);
+    }
+
+private:
+    void set(double B0, double B1, double B2, double A1, double A2) {
+        b0 = static_cast<float>(B0); b1 = static_cast<float>(B1); b2 = static_cast<float>(B2);
+        a1 = static_cast<float>(A1); a2 = static_cast<float>(A2);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Sobremuestreo 2x.
+//
+// PARA QUE. Cualquier no linealidad -- un tanh, un recorte -- genera armonicos.
+// Los que caen por encima de Nyquist (24 kHz) no desaparecen: se DOBLAN hacia
+// abajo y reaparecen como frecuencias que no son armonicas de la nota. Se oye
+// como aspereza metalica en notas agudas, y como suciedad que no corresponde al
+// acorde que tocaste. Procesar al doble de tasa mueve ese doblez a 48 kHz, y el
+// filtro de bajada lo elimina antes de volver.
+//
+// Butterworth de 4to orden (dos biquads) en subida y en bajada.
+// ---------------------------------------------------------------------------
+class Oversampler2x {
+public:
+    void prepare(double sampleRate, int maxBlock) {
+        _sr2 = sampleRate * 2.0;
+        _up.assign(static_cast<size_t>(maxBlock) * 2, 0.0f);
+        const double fc = sampleRate * 0.45;          // justo debajo del Nyquist original
+        _upA.lowpass(_sr2, fc, 0.54119610);           // Q de Butterworth, par 1
+        _upB.lowpass(_sr2, fc, 1.30656296);           // par 2
+        _dnA.lowpass(_sr2, fc, 0.54119610);
+        _dnB.lowpass(_sr2, fc, 1.30656296);
+        reset();
+    }
+    void reset() { _upA.reset(); _upB.reset(); _dnA.reset(); _dnB.reset(); }
+
+    // fn recibe el buffer al doble de tasa y lo modifica en el sitio.
+    template <class F>
+    void process(float* buf, int n, F&& fn) {
+        float* up = _up.data();
+        for (int i = 0; i < n; ++i) {
+            // Insertar ceros duplica la tasa pero deja una copia espejada del
+            // espectro; el filtro la quita. El x2 recupera la energia perdida.
+            up[2 * i]     = _upB.process(_upA.process(buf[i] * 2.0f));
+            up[2 * i + 1] = _upB.process(_upA.process(0.0f));
+        }
+        fn(up, n * 2);
+        for (int i = 0; i < n; ++i) {
+            const float a = _dnB.process(_dnA.process(up[2 * i]));
+            _dnB.process(_dnA.process(up[2 * i + 1]));    // se filtra y se descarta
+            buf[i] = a;
+        }
+    }
+
+    double rate() const { return _sr2; }
+
+private:
+    std::vector<float> _up;
+    Biquad _upA, _upB, _dnA, _dnB;
+    double _sr2 = 96000.0;
+};
+
+// ---------------------------------------------------------------------------
+// EQ de tres bandas: shelf grave, campana media, shelf agudo.
+// ---------------------------------------------------------------------------
+class EQ : public Effect {
+public:
+    const char* name() const override { return "eq"; }
+
+    void setLow(float db)   { _lowDb = db;  _dirty.store(true); }
+    void setMid(float db)   { _midDb = db;  _dirty.store(true); }
+    void setMidFreq(float f){ _midHz = f;   _dirty.store(true); }
+    void setHigh(float db)  { _highDb = db; _dirty.store(true); }
+
+    void prepare(double sampleRate, int) override {
+        _sr = sampleRate;
+        _dirty.store(true);
+        reset();
+    }
+    void reset() override { _lo.reset(); _mid.reset(); _hi.reset(); }
+
+    void collectParams(std::vector<Param>& out) override {
+        out.push_back(Param{"eq.low", "Low", "dB", -15.0f, 15.0f, 0.1f,
+            [this](float v) { setLow(v); }, [this]() { return _lowDb; }});
+        out.push_back(Param{"eq.mid", "Mid", "dB", -15.0f, 15.0f, 0.1f,
+            [this](float v) { setMid(v); }, [this]() { return _midDb; }});
+        out.push_back(Param{"eq.midfreq", "Mid f", "Hz", 200.0f, 3000.0f, 10.0f,
+            [this](float v) { setMidFreq(v); }, [this]() { return _midHz; }});
+        out.push_back(Param{"eq.high", "High", "dB", -15.0f, 15.0f, 0.1f,
+            [this](float v) { setHigh(v); }, [this]() { return _highDb; }});
+    }
+
+    void process(float* buf, int n) override {
+        if (_dirty.exchange(false)) {
+            _lo.lowShelf(_sr, 120.0, _lowDb);
+            _mid.peaking(_sr, _midHz, 0.9, _midDb);
+            _hi.highShelf(_sr, 3200.0, _highDb);
+        }
+        for (int i = 0; i < n; ++i)
+            buf[i] = _hi.process(_mid.process(_lo.process(buf[i])));
+    }
+
+private:
+    Biquad _lo, _mid, _hi;
+    std::atomic<bool> _dirty{true};
+    double _sr = 48000.0;
+    float _lowDb = 0.0f, _midDb = 0.0f, _highDb = 0.0f, _midHz = 800.0f;
+};
+
+// ---------------------------------------------------------------------------
+// Compresor.
+//
+// El calculo de la reduccion de ganancia se hace en DECIBELES, no en amplitud
+// lineal. Es importante: el oido percibe el volumen de forma logaritmica, asi
+// que un ataque exponencial sobre dB suena natural, y sobre amplitud lineal
+// suena a bombeo. Es la diferencia entre un compresor y un limitador raro.
+// ---------------------------------------------------------------------------
+class Compressor : public Effect {
+public:
+    const char* name() const override { return "compressor"; }
+
+    void setThresholdDb(float v) { _thrDb = v; }
+    void setRatio(float v)       { _ratio = (v < 1.0f) ? 1.0f : v; }
+    void setAttackMs(float v)    { _attMs = v; _dirty = true; }
+    void setReleaseMs(float v)   { _relMs = v; _dirty = true; }
+    void setMakeupDb(float v)    { _makeDb = v; }
+
+    void prepare(double sampleRate, int) override {
+        _sr = sampleRate;
+        _dirty = true;
+        reset();
+    }
+    void reset() override { _gr = 0.0f; }
+
+    void collectParams(std::vector<Param>& out) override {
+        out.push_back(Param{"compressor.threshold", "Thresh", "dB", -50.0f, 0.0f, 0.5f,
+            [this](float v) { setThresholdDb(v); }, [this]() { return _thrDb; }});
+        out.push_back(Param{"compressor.ratio", "Ratio", ":1", 1.0f, 20.0f, 0.1f,
+            [this](float v) { setRatio(v); }, [this]() { return _ratio; }});
+        out.push_back(Param{"compressor.attack", "Attack", "ms", 0.5f, 100.0f, 0.5f,
+            [this](float v) { setAttackMs(v); }, [this]() { return _attMs; }});
+        out.push_back(Param{"compressor.release", "Release", "ms", 10.0f, 1000.0f, 5.0f,
+            [this](float v) { setReleaseMs(v); }, [this]() { return _relMs; }});
+        out.push_back(Param{"compressor.makeup", "Makeup", "dB", 0.0f, 24.0f, 0.1f,
+            [this](float v) { setMakeupDb(v); }, [this]() { return _makeDb; }});
+    }
+
+    void process(float* buf, int n) override {
+        if (_dirty) {
+            _attCoef = static_cast<float>(std::exp(-1.0 / (_sr * _attMs * 0.001)));
+            _relCoef = static_cast<float>(std::exp(-1.0 / (_sr * _relMs * 0.001)));
+            _dirty = false;
+        }
+        const float makeup = dbToGain(_makeDb);
+        const float slope  = 1.0f - 1.0f / _ratio;
+
+        for (int i = 0; i < n; ++i) {
+            const float a = std::fabs(buf[i]) + 1e-9f;
+            const float dB = 20.0f * std::log10(a);
+            const float over = dB - _thrDb;
+            const float target = (over > 0.0f) ? -over * slope : 0.0f;   // reduccion, en dB
+
+            // Mas reduccion = ataque; volver a cero = release.
+            const float coef = (target < _gr) ? _attCoef : _relCoef;
+            _gr = target + coef * (_gr - target);
+
+            buf[i] *= dbToGain(_gr) * makeup;
+        }
+    }
+
+    float gainReductionDb() const { return _gr; }
+
+private:
+    double _sr = 48000.0;
+    float _thrDb = -18.0f, _ratio = 4.0f, _attMs = 10.0f, _relMs = 120.0f, _makeDb = 0.0f;
+    float _attCoef = 0.0f, _relCoef = 0.0f, _gr = 0.0f;
+    bool  _dirty = true;
+};
+
 // ---------------------------------------------------------------------------
 // Noise gate.
 //
@@ -267,17 +503,28 @@ public:
     void setTone(float v)  { _tone.set(clamp01(v)); }    // 0..1
     void setLevel(float v) { _level.set(clamp01(v)); }   // 0..1
 
-    void prepare(double sampleRate, int) override {
+    void setOversample(bool on) { _os.store(on, std::memory_order_relaxed); }
+
+    void prepare(double sampleRate, int maxBlock) override {
         _sr = sampleRate;
-        // pasa-altos de un polo a ~720 Hz: la frecuencia de esquina del TS
-        _hpCoef = static_cast<float>(std::exp(-2.0 * static_cast<double>(kPi) * 720.0 / sampleRate));
+        _ovs.prepare(sampleRate, maxBlock);
+        _dv.assign(static_cast<size_t>(maxBlock), 0.0f);
+        _tn.assign(static_cast<size_t>(maxBlock), 0.0f);
+        _lv.assign(static_cast<size_t>(maxBlock), 0.0f);
+        // El pasa-altos y el recorte corren a la tasa a la que toque procesar.
+        setRate(sampleRate);
         _drive.prepare(sampleRate);
         _tone.prepare(sampleRate);
         _level.prepare(sampleRate);
         reset();
     }
 
-    void reset() override { _hpX = _hpY = _lp = 0.0f; }
+    void setRate(double rate) {
+        _rate   = rate;
+        _hpCoef = static_cast<float>(std::exp(-2.0 * static_cast<double>(kPi) * 720.0 / rate));
+    }
+
+    void reset() override { _hpX = _hpY = _lp = 0.0f; _ovs.reset(); }
 
     void collectParams(std::vector<Param>& out) override {
         out.push_back(Param{"overdrive.drive", "Drive", "", 0.0f, 1.0f, 0.01f,
@@ -286,38 +533,53 @@ public:
             [this](float v) { setTone(v); }, [this]() { return _tone.target(); }});
         out.push_back(Param{"overdrive.level", "Level", "", 0.0f, 1.0f, 0.01f,
             [this](float v) { setLevel(v); }, [this]() { return _level.target(); }});
+        out.push_back(Param{"overdrive.oversample", "2x", "", 0.0f, 1.0f, 1.0f,
+            [this](float v) { setOversample(v >= 0.5f); },
+            [this]() { return _os.load(std::memory_order_relaxed) ? 1.0f : 0.0f; }});
     }
 
     void process(float* buf, int n) override {
-        for (int i = 0; i < n; ++i) {
-            const float x = buf[i];
-
-            // pasa-altos de un polo
-            _hpY = _hpCoef * (_hpY + x - _hpX);
-            _hpX = x;
-
-            // la ganancia de la etapa: 1x en graves, hasta ~30x en medios
-            const float drive = _drive.next();
-            const float boost = 1.0f + drive * 29.0f;
-            float y = std::tanh(x + boost * _hpY);
-
-            // tono: pasa-bajos de un polo entre 1.2 kHz y 8 kHz
-            const float tone   = _tone.next();
-            const float fc     = 1200.0f + tone * 6800.0f;
-            const float lpCoef = 1.0f - std::exp(-2.0f * kPi * fc / static_cast<float>(_sr));
-            _lp += lpCoef * (y - _lp);
-
-            // compensacion: a mas drive, mas fuerte sale, asi que se baja
-            const float makeup = 1.0f / (1.0f + drive * 2.0f);
-            buf[i] = _lp * makeup * (0.2f + _level.next() * 1.8f);
+        // Los parametros suavizados avanzan una vez por muestra de ENTRADA,
+        // no del buffer sobremuestreado: si no, correrian al doble de velocidad.
+        if (_os.load(std::memory_order_relaxed)) {
+            for (int i = 0; i < n; ++i) { _dv[i] = _drive.next(); _tn[i] = _tone.next(); _lv[i] = _level.next(); }
+            if (_rate != _ovs.rate()) setRate(_ovs.rate());
+            _ovs.process(buf, n, [&](float* up, int n2) {
+                for (int i = 0; i < n2; ++i) up[i] = shape(up[i], _dv[i / 2], _tn[i / 2]);
+            });
+            for (int i = 0; i < n; ++i) {
+                const float makeup = 1.0f / (1.0f + _dv[i] * 2.0f);
+                buf[i] *= makeup * (0.2f + _lv[i] * 1.8f);
+            }
+        } else {
+            if (_rate != _sr) setRate(_sr);
+            for (int i = 0; i < n; ++i) {
+                const float drive = _drive.next(), tone = _tone.next(), lvl = _level.next();
+                const float y = shape(buf[i], drive, tone);
+                const float makeup = 1.0f / (1.0f + drive * 2.0f);
+                buf[i] = y * makeup * (0.2f + lvl * 1.8f);
+            }
         }
     }
 
 private:
+    inline float shape(float x, float drive, float tone) {
+        _hpY = _hpCoef * (_hpY + x - _hpX);          // pasa-altos de un polo
+        _hpX = x;
+        const float boost = 1.0f + drive * 29.0f;    // 1x en graves, ~30x en medios
+        const float y = std::tanh(x + boost * _hpY);
+        const float fc     = 1200.0f + tone * 6800.0f;
+        const float lpCoef = 1.0f - std::exp(-2.0f * kPi * fc / static_cast<float>(_rate));
+        _lp += lpCoef * (y - _lp);
+        return _lp;
+    }
     static float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
     Smoothed _drive, _tone, _level;
-    double _sr = 48000.0;
+    Oversampler2x _ovs;
+    std::atomic<bool> _os{true};
+    double _sr = 48000.0, _rate = 48000.0;
     float _hpCoef = 0, _hpX = 0, _hpY = 0, _lp = 0;
+    std::vector<float> _dv, _tn, _lv;      // parametros por muestra, dimensionados en prepare
 };
 
 
@@ -655,10 +917,16 @@ public:
     void setTone(float v)  { _tone.set(clamp01(v)); }
     void setLevel(float v) { _level.set(clamp01(v)); }
 
-    void prepare(double sampleRate, int) override {
+    void setOversample(bool on) { _os.store(on, std::memory_order_relaxed); }
+
+    void prepare(double sampleRate, int maxBlock) override {
         _sr = sampleRate;
-        _hpCoef = static_cast<float>(std::exp(-2.0 * static_cast<double>(kPi) * 100.0 / sampleRate));
-        _dcCoef = static_cast<float>(std::exp(-2.0 * static_cast<double>(kPi) * 12.0 / sampleRate));
+        _ovs.prepare(sampleRate, maxBlock);
+        _dv.assign(static_cast<size_t>(maxBlock), 0.0f);
+        _bs.assign(static_cast<size_t>(maxBlock), 0.0f);
+        _tn.assign(static_cast<size_t>(maxBlock), 0.0f);
+        _lv.assign(static_cast<size_t>(maxBlock), 0.0f);
+        setRate(sampleRate);
         _drive.prepare(sampleRate);
         _bias.prepare(sampleRate);
         _tone.prepare(sampleRate);
@@ -666,7 +934,13 @@ public:
         reset();
     }
 
-    void reset() override { _hpX = _hpY = _dcX = _dcY = _lp = 0.0f; }
+    void setRate(double rate) {
+        _rate   = rate;
+        _hpCoef = static_cast<float>(std::exp(-2.0 * static_cast<double>(kPi) * 100.0 / rate));
+        _dcCoef = static_cast<float>(std::exp(-2.0 * static_cast<double>(kPi) * 12.0 / rate));
+    }
+
+    void reset() override { _hpX = _hpY = _dcX = _dcY = _lp = 0.0f; _ovs.reset(); }
 
     void collectParams(std::vector<Param>& out) override {
         out.push_back(Param{"fuzz.drive", "Drive", "", 0.0f, 1.0f, 0.01f,
@@ -677,38 +951,55 @@ public:
             [this](float v) { setTone(v); }, [this]() { return _tone.target(); }});
         out.push_back(Param{"fuzz.level", "Level", "", 0.0f, 1.0f, 0.01f,
             [this](float v) { setLevel(v); }, [this]() { return _level.target(); }});
+        out.push_back(Param{"fuzz.oversample", "2x", "", 0.0f, 1.0f, 1.0f,
+            [this](float v) { setOversample(v >= 0.5f); },
+            [this]() { return _os.load(std::memory_order_relaxed) ? 1.0f : 0.0f; }});
     }
 
     void process(float* buf, int n) override {
         for (int i = 0; i < n; ++i) {
-            const float x = buf[i];
-
-            // capacitor de acoplamiento: fuera los graves antes de recortar
-            _hpY = _hpCoef * (_hpY + x - _hpX);
-            _hpX = x;
-
-            const float drive = _drive.next();
-            const float gain  = 2.0f + drive * drive * 200.0f;   // hasta ~200x
-            float v = _hpY * gain + _bias.next();
-
-            // recorte cubico: suave hasta +-1, y de ahi plano
-            v = clipCubic(v);
-
-            // bloqueo de DC -- obligatorio despues de un recorte asimetrico
-            _dcY = v - _dcX + _dcCoef * _dcY;
-            _dcX = v;
-            float y = _dcY;
-
-            // tono: pasa-bajos entre 700 Hz y 6 kHz
-            const float fc     = 700.0f + _tone.next() * 5300.0f;
-            const float lpCoef = 1.0f - std::exp(-2.0f * kPi * fc / static_cast<float>(_sr));
-            _lp += lpCoef * (y - _lp);
-
-            buf[i] = _lp * _level.next() * 0.6f;
+            _dv[static_cast<size_t>(i)] = _drive.next();
+            _bs[static_cast<size_t>(i)] = _bias.next();
+            _tn[static_cast<size_t>(i)] = _tone.next();
+            _lv[static_cast<size_t>(i)] = _level.next();
         }
+        if (_os.load(std::memory_order_relaxed)) {
+            if (_rate != _ovs.rate()) setRate(_ovs.rate());
+            _ovs.process(buf, n, [&](float* up, int n2) {
+                for (int i = 0; i < n2; ++i) {
+                    const size_t k = static_cast<size_t>(i / 2);
+                    up[i] = shape(up[i], _dv[k], _bs[k], _tn[k]);
+                }
+            });
+        } else {
+            if (_rate != _sr) setRate(_sr);
+            for (int i = 0; i < n; ++i) {
+                const size_t k = static_cast<size_t>(i);
+                buf[i] = shape(buf[i], _dv[k], _bs[k], _tn[k]);
+            }
+        }
+        for (int i = 0; i < n; ++i) buf[i] *= _lv[static_cast<size_t>(i)] * 0.6f;
     }
 
 private:
+    inline float shape(float x, float drive, float bias, float tone) {
+        // capacitor de acoplamiento: fuera los graves antes de recortar
+        _hpY = _hpCoef * (_hpY + x - _hpX);
+        _hpX = x;
+
+        const float gain = 2.0f + drive * drive * 200.0f;    // hasta ~200x
+        float v = clipCubic(_hpY * gain + bias);
+
+        // bloqueo de DC -- obligatorio despues de un recorte asimetrico
+        _dcY = v - _dcX + _dcCoef * _dcY;
+        _dcX = v;
+
+        const float fc     = 700.0f + tone * 5300.0f;
+        const float lpCoef = 1.0f - std::exp(-2.0f * kPi * fc / static_cast<float>(_rate));
+        _lp += lpCoef * (_dcY - _lp);
+        return _lp;
+    }
+
     static inline float clipCubic(float v) {
         if (v >  1.0f) return  1.0f;
         if (v < -1.0f) return -1.0f;
@@ -718,7 +1009,10 @@ private:
     static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
     Smoothed _drive, _bias, _tone, _level;
-    double _sr = 48000.0;
+    Oversampler2x _ovs;
+    std::atomic<bool> _os{true};
+    std::vector<float> _dv, _bs, _tn, _lv;
+    double _sr = 48000.0, _rate = 48000.0;
     float _hpCoef = 0, _hpX = 0, _hpY = 0;
     float _dcCoef = 0, _dcX = 0, _dcY = 0;
     float _lp = 0;
